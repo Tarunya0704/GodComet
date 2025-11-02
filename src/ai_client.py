@@ -1,4 +1,4 @@
-"""AI Client with OpenAI"""
+"""AI Client with OpenAI - Fixed for MCP 1.19.0+"""
 from openai import OpenAI
 from .mcp_server import MCPServer
 from .database import DatabaseManager
@@ -25,7 +25,7 @@ class AIClient:
         logger.info(f"Executing: {command}")
         
         try:
-            # Get tools from MCP
+            # Get tools from MCP (FIXED - using new method)
             tools_list = await self.mcp.get_tools_list()
             
             # Convert to OpenAI function format
@@ -46,7 +46,7 @@ class AIClient:
             messages = [
                 {
                     "role": "system",
-                    "content": "You are an AI automation assistant. Use the available tools to complete user tasks. Be thorough and provide clear feedback about what you're doing."
+                    "content": "You are an AI automation assistant. Use the available tools to complete user tasks. Be thorough and provide clear feedback about what you're doing. Always use the tools provided rather than just explaining what to do."
                 },
                 {
                     "role": "user",
@@ -101,13 +101,32 @@ class AIClient:
                         logger.info(f"Executing tool: {function_name} with args: {function_args}")
                         
                         try:
-                            # Call the tool through MCP
+                            # Call the tool through MCP (FIXED - using new method)
                             result = await self.mcp.execute_tool(
                                 function_name,
                                 function_args
                             )
                             
-                            result_text = result[0].text if result else "Tool executed"
+                            # Format result text
+                            if result.get("success"):
+                                result_text = f"✅ {result.get('message', 'Success')}"
+                                if result.get('data'):
+                                    # Add important data
+                                    data = result['data']
+                                    if 'title' in data:
+                                        result_text += f"\nVideo Title: {data['title']}"
+                                    if 'url' in data:
+                                        result_text += f"\nURL: {data['url']}"
+                                    if 'buckets' in data:
+                                        result_text += f"\nBuckets: {', '.join(data['buckets'][:5])}"
+                                    if 'files' in data:
+                                        result_text += f"\nFiles found: {len(data['files'])}"
+                                    if 'content' in data:
+                                        content_preview = data['content'][:200]
+                                        result_text += f"\nContent preview: {content_preview}..."
+                            else:
+                                result_text = f"❌ Error: {result.get('error', 'Unknown error')}"
+                            
                             logger.info(f"Tool result: {result_text[:100]}")
                             
                             # Add tool result to messages
@@ -116,12 +135,13 @@ class AIClient:
                                 "tool_call_id": tool_call.id,
                                 "content": result_text
                             })
+                            
                         except Exception as e:
-                            logger.error(f"Tool execution error: {e}")
+                            logger.error(f"Tool execution error: {e}", exc_info=True)
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool_call.id,
-                                "content": f"Error: {str(e)}"
+                                "content": f"❌ Error: {str(e)}"
                             })
                     
                     # Continue loop to let AI process results

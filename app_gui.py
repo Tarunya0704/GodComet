@@ -116,7 +116,8 @@ class AutomationGUI:
                 self.log("✅ AWS configured")
             
             self.log("🤖 Initializing AI client...")
-            self.ai = AIClient(Config.ANTHROPIC_API_KEY, self.mcp)
+            # FIXED: Using OPENAI_API_KEY from Config
+            self.ai = AIClient(Config.OPENAI_API_KEY, self.mcp)
             self.log("✅ System ready!\n")
             self.log("💡 Try: 'play music on youtube'\n")
             
