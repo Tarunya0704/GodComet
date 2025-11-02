@@ -1,0 +1,28 @@
+"""Configuration management"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Config:
+    """Application configuration"""
+    
+    # API Keys
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+    AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+    AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
+    
+    # Database
+    DATABASE_PATH = 'data/automation.db'
+    
+    # Logging
+    LOG_PATH = 'logs/automation.log'
+    LOG_LEVEL = 'INFO'
+    
+    @classmethod
+    def validate(cls):
+        """Validate required configuration"""
+        if not cls.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY not set in .env file")
+        return True
