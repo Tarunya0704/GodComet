@@ -1,5 +1,5 @@
-"""AI Client with OpenAI - Fixed for MCP 1.19.0+"""
-from openai import OpenAI
+"""AI Client with Groq - Ultra-fast AI inference"""
+from groq import Groq
 from .mcp_server import MCPServer
 from .database import DatabaseManager
 import time
@@ -9,13 +9,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 class AIClient:
-    """AI client using OpenAI GPT-4o with MCP"""
+    """AI client using Groq with MCP"""
     
     def __init__(self, api_key: str, mcp_server: MCPServer):
-        self.client = OpenAI(api_key=api_key)
+        # Initialize Groq client
+        self.client = Groq(api_key=api_key)
         self.mcp = mcp_server
         self.db = DatabaseManager()
-        logger.info("OpenAI client initialized")
+        logger.info("Groq client initialized")
     
     async def execute(self, command: str) -> dict:
         """Execute command with AI"""
@@ -25,13 +26,13 @@ class AIClient:
         logger.info(f"Executing: {command}")
         
         try:
-            # Get tools from MCP (FIXED - using new method)
+            # Get tools from MCP
             tools_list = await self.mcp.get_tools_list()
             
-            # Convert to OpenAI function format
-            tools_for_openai = []
+            # Convert to Groq function format (same as OpenAI)
+            tools_for_groq = []
             for t in tools_list:
-                tools_for_openai.append({
+                tools_for_groq.append({
                     "type": "function",
                     "function": {
                         "name": t.name,
@@ -40,13 +41,13 @@ class AIClient:
                     }
                 })
             
-            logger.info(f"Available tools: {[t['function']['name'] for t in tools_for_openai]}")
+            logger.info(f"Available tools: {[t['function']['name'] for t in tools_for_groq]}")
             
             # Create messages
             messages = [
                 {
                     "role": "system",
-                    "content": "You are an AI automation assistant. Use the available tools to complete user tasks. Be thorough and provide clear feedback about what you're doing. Always use the tools provided rather than just explaining what to do."
+                    "content": "You are an AI automation assistant powered by Groq. Use the available tools to complete user tasks. Be thorough and provide clear feedback about what you're doing. Always use the tools provided rather than just explaining what to do."
                 },
                 {
                     "role": "user",
@@ -60,19 +61,20 @@ class AIClient:
             
             while iteration < max_iterations:
                 iteration += 1
-                logger.info(f"AI iteration {iteration}/{max_iterations}")
+                logger.info(f"Groq iteration {iteration}/{max_iterations}")
                 
-                # Call OpenAI
+                # Call Groq API (using llama model with function calling support)
                 response = self.client.chat.completions.create(
-                    model="gpt-4o",
+                    model="llama-3.3-70b-versatile",  # Best model for function calling
                     messages=messages,
-                    tools=tools_for_openai,
+                    tools=tools_for_groq,
                     tool_choice="auto",
-                    temperature=0.1
+                    temperature=0.1,
+                    max_tokens=4096
                 )
                 
                 assistant_message = response.choices[0].message
-                logger.info(f"AI response - has tool calls: {bool(assistant_message.tool_calls)}")
+                logger.info(f"Groq response - has tool calls: {bool(assistant_message.tool_calls)}")
                 
                 # Check if AI wants to call functions
                 if assistant_message.tool_calls:
@@ -101,7 +103,7 @@ class AIClient:
                         logger.info(f"Executing tool: {function_name} with args: {function_args}")
                         
                         try:
-                            # Call the tool through MCP (FIXED - using new method)
+                            # Call the tool through MCP
                             result = await self.mcp.execute_tool(
                                 function_name,
                                 function_args

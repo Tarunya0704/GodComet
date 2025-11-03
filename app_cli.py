@@ -9,19 +9,20 @@ from src.ai_client import AIClient
 
 async def main():
     print("=" * 60)
-    print("  🤖 MCP AI Automation System - OpenAI Version")
+    print("  ⚡ MCP AI Automation System - Groq AI")
+    print("  🚀 Ultra-Fast AI Inference")
     print("=" * 60)
     print()
     
     # Validate config
     try:
         Config.validate()
-        print("✅ OpenAI API key loaded")
+        print("✅ Groq API key loaded")
     except ValueError as e:
         print(f"❌ Configuration error: {e}")
         print("\nPlease create a .env file with:")
-        print("OPENAI_API_KEY=sk-proj-your-key-here")
-        print("\nGet your key from: https://platform.openai.com/api-keys")
+        print("GROQ_API_KEY=gsk_your-key-here")
+        print("\nGet your key from: https://console.groq.com/")
         return
     
     # Initialize
@@ -38,8 +39,8 @@ async def main():
     else:
         print("⚠️  AWS not configured (optional)")
     
-    print("🤖 Initializing AI client with OpenAI GPT-4o...")
-    ai = AIClient(Config.OPENAI_API_KEY, mcp)
+    print("⚡ Initializing AI client with Groq (ultra-fast)...")
+    ai = AIClient(Config.GROQ_API_KEY, mcp)
     print("✅ System ready!")
     print()
     
@@ -49,13 +50,14 @@ async def main():
     print("   • go to google.com")
     print("   • list files")
     print()
+    print("💨 Groq is 10x faster than OpenAI!")
     print("Commands: 'quit' or 'exit' to stop, 'history' for past tasks")
     print("=" * 60)
     print()
     
     while True:
         try:
-            command = input("🤖 Command: ").strip()
+            command = input("⚡ Groq Command: ").strip()
             
             if not command:
                 continue
@@ -77,7 +79,7 @@ async def main():
                 continue
             
             print(f"\n▶️  Executing: {command}")
-            print("🔄 OpenAI is processing...\n")
+            print("⚡ Groq is processing at lightning speed...\n")
             
             result = await ai.execute(command)
             
@@ -86,7 +88,7 @@ async def main():
                 print("✅ Success!")
                 print(f"\n{result['result']['message']}")
                 print(f"\n📊 AI Iterations: {result['result']['iterations']}")
-                print(f"⏱️  Time: {result['execution_time']:.2f}s")
+                print(f"⏱️  Time: {result['execution_time']:.2f}s ⚡")
             else:
                 print("❌ Failed!")
                 print(f"\nError: {result['error']}")

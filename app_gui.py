@@ -12,7 +12,7 @@ from src.ai_client import AIClient
 class AutomationGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("🤖 MCP AI Automation")
+        self.root.title("⚡ MCP AI Automation - Groq")
         self.root.geometry("1000x700")
         self.root.configure(bg='#1e1e2e')
         
@@ -29,12 +29,22 @@ class AutomationGUI:
         # Header
         header = tk.Label(
             self.root,
-            text="🤖 MCP AI Automation System",
+            text="⚡ MCP AI Automation - Groq",
             font=("Helvetica", 24, "bold"),
             bg='#1e1e2e',
             fg='#58a6ff'
         )
         header.pack(pady=20)
+        
+        # Subtitle
+        subtitle = tk.Label(
+            self.root,
+            text="🚀 Ultra-Fast AI Inference",
+            font=("Helvetica", 12),
+            bg='#1e1e2e',
+            fg='#3fb950'
+        )
+        subtitle.pack(pady=(0, 20))
         
         # Command input
         tk.Label(
@@ -59,7 +69,7 @@ class AutomationGUI:
         # Execute button
         self.execute_btn = tk.Button(
             self.root,
-            text="▶ Execute Command",
+            text="⚡ Execute Command",
             command=self.execute_command_threaded,
             bg='#58a6ff',
             fg='white',
@@ -115,15 +125,16 @@ class AutomationGUI:
                 )
                 self.log("✅ AWS configured")
             
-            self.log("🤖 Initializing AI client...")
-            # FIXED: Using OPENAI_API_KEY from Config
-            self.ai = AIClient(Config.OPENAI_API_KEY, self.mcp)
-            self.log("✅ System ready!\n")
-            self.log("💡 Try: 'play music on youtube'\n")
+            self.log("⚡ Initializing AI client with Groq...")
+            # FIXED: Using GROQ_API_KEY from Config
+            self.ai = AIClient(Config.GROQ_API_KEY, self.mcp)
+            self.log("✅ System ready!")
+            self.log("💡 Try: 'play god's plan on youtube'")
+            self.log("💨 Groq is 10x faster than OpenAI!\n")
             
         except ValueError as e:
             self.log(f"❌ Configuration error: {e}")
-            self.log("Please configure .env file with your API keys")
+            self.log("Please configure .env file with your GROQ_API_KEY")
             messagebox.showerror("Configuration Error", str(e))
     
     def log(self, message: str):
@@ -156,7 +167,7 @@ class AutomationGUI:
         
         try:
             self.log(f"▶️ Executing: {command}")
-            self.log("🔄 AI is processing...\n")
+            self.log("⚡ Groq is processing at lightning speed...\n")
             
             future = asyncio.run_coroutine_threadsafe(
                 self.ai.execute(command),
@@ -168,7 +179,8 @@ class AutomationGUI:
             if result["success"]:
                 self.log("✅ Success!")
                 self.log(f"\n{result['result']['message']}")
-                self.log(f"\n⏱️  Time: {result['execution_time']:.2f}s")
+                self.log(f"\n📊 AI Iterations: {result['result']['iterations']}")
+                self.log(f"⏱️  Time: {result['execution_time']:.2f}s ⚡")
             else:
                 self.log("❌ Failed!")
                 self.log(f"\nError: {result['error']}")
@@ -180,7 +192,7 @@ class AutomationGUI:
             self.log(f"❌ Error: {str(e)}")
         finally:
             self.is_executing = False
-            self.execute_btn.config(state=tk.NORMAL, text="▶ Execute Command")
+            self.execute_btn.config(state=tk.NORMAL, text="⚡ Execute Command")
 
 def main():
     root = tk.Tk()
