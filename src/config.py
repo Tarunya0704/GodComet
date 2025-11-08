@@ -9,6 +9,13 @@ class Config:
     
     # API Keys
     GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+    
+    # Jira
+    JIRA_URL = os.getenv('JIRA_URL')
+    JIRA_EMAIL = os.getenv('JIRA_EMAIL')
+    JIRA_API_TOKEN = os.getenv('JIRA_API_TOKEN')
+    
+    # AWS
     AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
     AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
     AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
