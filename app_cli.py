@@ -109,13 +109,168 @@
 #         print("\n\n👋 Goodbye!")
 
 #!/usr/bin/env python3
-"""CLI Application - Main Entry Point"""
+
+
+"""CLI Application - Main Entry Point - Updated with GitHub & Vercel"""
 import asyncio
 import os
 import sys
+from pathlib import Path
+from datetime import datetime
 from src.config import Config
 from src.mcp_server import MCPServer
 from src.ai_client import AIClient
+import docx
+from docx.shared import Inches
+
+async def handle_jira_visual_command(mcp, command):
+    """Handle Jira visual commands with screenshots"""
+    
+    # Extract document path from command
+    doc_path = None
+    words = command.split()
+    for word in words:
+        if 'documents/' in word or 'documents\\' in word or '.docx' in word or '.pdf' in word:
+            doc_path = word.strip('"\'')
+            break
+    
+    # Default path if not specified
+    if not doc_path:
+        doc_path = 'documents/Assignment-11 Monday.docx'
+    
+    # Convert to Path object (handles both / and \)
+    doc_path = Path(doc_path)
+    
+    # Check if file exists
+    if not doc_path.exists():
+        print(f"❌ File not found: {doc_path}")
+        print("💡 Available files:")
+        docs_dir = Path('documents')
+        if docs_dir.exists():
+            for f in docs_dir.glob('*.docx'):
+                print(f"   - {f}")
+            print("\n💡 Try one of these commands:")
+            for f in docs_dir.glob('*.docx'):
+                print(f'   complete jira assignment "{f}"')
+        return
+    
+    # Check if screenshots requested
+    with_screenshots = any(word in command.lower() for word in ['screenshot', 'screenshots', 'ss', 'visual', 'document'])
+    
+    print(f"\n🎬 Starting Visual Jira Automation")
+    if with_screenshots:
+        print("📸 WITH Screenshots - Word document will be generated")
+    print(f"📄 Document: {doc_path}")
+    print("="*60)
+    
+    # Parse document
+    from src.tools.document_parser import DocumentParser
+    parser = DocumentParser()
+    parse_result = await parser.parse_document(str(doc_path), use_ai=False)
+    
+    if not parse_result['success']:
+        print(f"❌ Parse failed: {parse_result['error']}")
+        return
+    
+    config = parse_result['data']
+    print(f"✅ Parsed: {len(config.get('projects', []))} projects, {len(config.get('epics', []))} epics, {len(config.get('stories', []))} stories\n")
+    
+    if with_screenshots:
+        # Create with screenshots
+        screenshot_dir = Path("screenshots")
+        screenshot_dir.mkdir(exist_ok=True)
+        
+        # Initialize Word doc
+        screenshot_doc = docx.Document()
+        screenshot_doc.add_heading('Jira Automation - Visual Steps', 0)
+        screenshot_doc.add_paragraph(f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        screenshot_doc.add_paragraph(f'Document: {doc_path}')
+        screenshot_doc.add_page_break()
+        
+        # Start browser
+        await mcp.jira_visual.start_browser(headless=False)
+        
+        # Login (manual)
+        await mcp.jira_visual.login_to_jira()
+        if not mcp.jira_visual.is_logged_in:
+            print("❌ Login failed")
+            return
+        
+        # Screenshot after login
+        screenshot_path = screenshot_dir / "01_login.png"
+        await mcp.jira_visual.page.screenshot(path=str(screenshot_path))
+        screenshot_doc.add_heading("1. Login to Jira", level=1)
+        screenshot_doc.add_picture(str(screenshot_path), width=Inches(6))
+        screenshot_doc.add_page_break()
+        print("  📸 Screenshot: Login")
+        
+        # Create Projects
+        print("\n📁 Creating Projects...")
+        for idx, proj in enumerate(config.get('projects', []), start=1):
+            await mcp.jira_visual.create_project_visual(proj['key'], proj['name'])
+            screenshot_path = screenshot_dir / f"02_project_{proj['key']}.png"
+            await mcp.jira_visual.page.screenshot(path=str(screenshot_path))
+            screenshot_doc.add_heading(f"2.{idx}. Project: {proj['key']}", level=1)
+            screenshot_doc.add_picture(str(screenshot_path), width=Inches(6))
+            screenshot_doc.add_page_break()
+            print(f"  📸 Screenshot: Project {proj['key']}")
+            await mcp.jira_visual.page.wait_for_timeout(2000)
+        
+        # Create Epics
+        print("\n📋 Creating Epics...")
+        for idx, epic in enumerate(config.get('epics', []), start=1):
+            await mcp.jira_visual.create_epic_visual(epic['project'], epic['name'])
+            screenshot_path = screenshot_dir / f"03_epic_{idx}.png"
+            await mcp.jira_visual.page.screenshot(path=str(screenshot_path))
+            screenshot_doc.add_heading(f"3.{idx}. Epic: {epic['name'][:50]}", level=1)
+            screenshot_doc.add_picture(str(screenshot_path), width=Inches(6))
+            screenshot_doc.add_page_break()
+            print(f"  📸 Screenshot: Epic {idx}")
+            await mcp.jira_visual.page.wait_for_timeout(1500)
+        
+        # Create Stories
+        print("\n📝 Creating Stories...")
+        for idx, story in enumerate(config.get('stories', []), start=1):
+            await mcp.jira_visual.create_story_visual(story['project'], story['summary'])
+            screenshot_path = screenshot_dir / f"04_story_{idx}.png"
+            await mcp.jira_visual.page.screenshot(path=str(screenshot_path))
+            screenshot_doc.add_heading(f"4.{idx}. Story: {story['summary'][:50]}", level=1)
+            screenshot_doc.add_picture(str(screenshot_path), width=Inches(6))
+            screenshot_doc.add_page_break()
+            print(f"  📸 Screenshot: Story {idx}")
+            await mcp.jira_visual.page.wait_for_timeout(1000)
+        
+        # Final screenshot
+        screenshot_path = screenshot_dir / "05_final.png"
+        await mcp.jira_visual.page.screenshot(path=str(screenshot_path))
+        screenshot_doc.add_heading("5. Final View", level=1)
+        screenshot_doc.add_picture(str(screenshot_path), width=Inches(6))
+        print("  📸 Screenshot: Final view")
+        
+        # Save Word doc
+        doc_filename = f"jira_automation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        screenshot_doc.save(doc_filename)
+        
+        print(f"\n✅ Word document saved: {doc_filename}")
+        print("👀 Browser will stay open for 30 seconds...")
+        await mcp.jira_visual.page.wait_for_timeout(30000)
+        
+        # Close browser
+        try:
+            if mcp.jira_visual.browser and mcp.jira_visual.browser.is_connected():
+                await mcp.jira_visual.browser.close()
+            if mcp.jira_visual.playwright:
+                await mcp.jira_visual.playwright.stop()
+        except:
+            pass
+    else:
+        # Without screenshots (just visual)
+        result = await mcp.jira_visual.create_assignment_visual(config)
+        if result['success']:
+            print(f"\n✅ {result['message']}")
+        else:
+            print(f"\n❌ Failed: {result.get('error')}")
+
 
 async def main():
     print("=" * 60)
@@ -139,7 +294,8 @@ async def main():
     print("🔧 Initializing MCP server...")
     mcp = MCPServer()
     
-    if Config.AWS_ACCESS_KEY_ID and Config.AWS_SECRET_ACCESS_KEY:
+    # AWS configuration
+    if Config.is_aws_configured():
         mcp.configure_aws(
             Config.AWS_ACCESS_KEY_ID,
             Config.AWS_SECRET_ACCESS_KEY,
@@ -150,7 +306,7 @@ async def main():
         print("⚠️  AWS not configured (optional)")
     
     # Jira configuration
-    if Config.JIRA_URL and Config.JIRA_EMAIL and Config.JIRA_API_TOKEN:
+    if Config.is_jira_configured():
         mcp.configure_jira(
             Config.JIRA_URL,
             Config.JIRA_EMAIL,
@@ -160,18 +316,46 @@ async def main():
     else:
         print("⚠️  Jira not configured (optional)")
     
+    # GitHub configuration (NEW)
+    if Config.is_github_configured():
+        mcp.configure_github(Config.GITHUB_TOKEN)
+        print(f"✅ GitHub configured")
+    else:
+        print("⚠️  GitHub not configured (optional - add GITHUB_TOKEN to .env)")
+    
+    # Vercel configuration (NEW)
+    if Config.is_vercel_configured():
+        mcp.configure_vercel(Config.VERCEL_TOKEN)
+        print(f"✅ Vercel configured")
+    else:
+        print("⚠️  Vercel not configured (optional - add VERCEL_TOKEN to .env)")
+    
     print("⚡ Initializing AI client with Groq (ultra-fast)...")
     ai = AIClient(Config.GROQ_API_KEY, mcp)
     print("✅ System ready!")
     print()
     
     print("💡 Example commands:")
-    print("   • play music on youtube")
-    print("   • create s3 bucket test-bucket-2024")
-    print("   • go to google.com")
-    print("   • list files")
-    print("   • create jira assignment")
-    print("   • create jira projects")
+    print("   🌐 Browser:")
+    print("      • play music on youtube")
+    print("      • go to google.com")
+    print()
+    print("   🐙 GitHub:")
+    print("      • create github repo my-awesome-project")
+    print("      • build this project and push to github as mcp-automation")
+    print("      • generate readme for this project")
+    print()
+    print("   ▲ Vercel:")
+    print("      • deploy this on vercel")
+    print("      • list my vercel deployments")
+    print()
+    print("   📋 Jira:")
+    print('      • complete jira assignment "documents\\Assignment.docx"')
+    print("      • complete jira assignment with screenshots")
+    print()
+    print("   📁 Files:")
+    print("      • list files")
+    print("      • read file config.py")
     print()
     print("💨 Groq is 10x faster than OpenAI!")
     print("Commands: 'quit' or 'exit' to stop, 'history' for past tasks")
@@ -180,7 +364,7 @@ async def main():
     
     while True:
         try:
-            command = input("⚡ Groq Command: ").strip()
+            command = input("⚡ Command: ").strip()
             
             if not command:
                 continue
@@ -199,6 +383,11 @@ async def main():
                     print(f"{status_icon} [{task[6][:19]}] {task[1][:50]}")
                 print("-" * 60)
                 print()
+                continue
+            
+            # Check for Jira commands
+            if any(word in command.lower() for word in ['jira', 'assignment', 'complete']):
+                await handle_jira_visual_command(mcp, command)
                 continue
             
             print(f"\n▶️  Executing: {command}")

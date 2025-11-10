@@ -1,4 +1,4 @@
-"""Jira Browser Automation - FIXED login and error handling"""
+"""Jira Browser Automation - FINAL FIX for SSO and manual login"""
 from playwright.async_api import async_playwright
 import logging
 import asyncio
@@ -7,9 +7,9 @@ from typing import Dict, Any
 logger = logging.getLogger(__name__)
 
 class JiraBrowserAutomation:
-    """Create Jira tickets visually using browser automation"""
+    """Create Jira tickets visually using browser automation - MANUAL LOGIN"""
     
-    def __init__(self, jira_url: str, email: str, api_token: str):
+    def __init__(self, jira_url: str, email: str = None, api_token: str = None):
         self.jira_url = jira_url.rstrip('/')
         self.email = email
         self.api_token = api_token
@@ -41,85 +41,95 @@ class JiraBrowserAutomation:
             return False
     
     async def login_to_jira(self):
-        """Login to Jira - FIXED VERSION"""
+        """Login to Jira - MANUAL VERSION WITH SSO SUPPORT"""
         try:
-            print("🔐 Logging into Jira...")
+            print("\n" + "="*70)
+            print("  🔐 MANUAL LOGIN REQUIRED")
+            print("="*70)
+            print(f"  Jira URL: {self.jira_url}")
+            print(f"  Email: {self.email}")
+            print("="*70)
             
-            # Go directly to Jira (might already be logged in)
-            await self.page.goto(f"{self.jira_url}/jira/your-work", timeout=30000)
-            await self.page.wait_for_timeout(3000)
+            # Go to Jira
+            print(f"\n📂 Opening Jira in browser...")
+            await self.page.goto(f"{self.jira_url}/jira/your-work", timeout=60000, wait_until='domcontentloaded')
+            await self.page.wait_for_timeout(5000)
             
             # Check if already logged in
             current_url = self.page.url
-            if '/jira/' in current_url and '/login' not in current_url:
-                print("✅ Already logged in!")
+            if '/jira/' in current_url and '/login' not in current_url and 'microsoftonline' not in current_url:
+                print("✅ Already logged in from previous session!")
                 self.is_logged_in = True
                 return True
             
-            # If redirected to login, handle it
-            if '/login' in current_url or 'id.atlassian.com' in current_url:
-                print("📝 Need to login...")
-                
-                # Wait for email field
-                try:
-                    email_field = await self.page.wait_for_selector(
-                        'input[name="username"], input[type="email"], input#username',
-                        timeout=5000
-                    )
-                    await email_field.fill(self.email)
-                    print(f"✅ Entered email: {self.email}")
-                    await self.page.wait_for_timeout(1000)
-                    
-                    # Click Continue/Submit
-                    continue_btn = await self.page.query_selector(
-                        'button[type="submit"], button#login-submit, button:has-text("Continue")'
-                    )
-                    if continue_btn:
-                        await continue_btn.click()
-                        await self.page.wait_for_timeout(2000)
-                except Exception as e:
-                    print(f"⚠️ Email step error: {e}")
-                
-                # Wait for password field
-                try:
-                    password_field = await self.page.wait_for_selector(
-                        'input[name="password"], input[type="password"], input#password',
-                        timeout=10000
-                    )
-                    await password_field.fill(self.api_token)
-                    print("✅ Entered API token")
-                    await self.page.wait_for_timeout(1000)
-                    
-                    # Click Login
-                    login_btn = await self.page.query_selector(
-                        'button[type="submit"], button#login-submit, button:has-text("Log in")'
-                    )
-                    if login_btn:
-                        await login_btn.click()
-                        await self.page.wait_for_timeout(5000)
-                        print("✅ Clicked login")
-                except Exception as e:
-                    print(f"⚠️ Password step error: {e}")
-                    print("⚠️ MANUAL LOGIN REQUIRED!")
-                    print(f"   1. Browser is open at: {self.page.url}")
-                    print(f"   2. Please login manually")
-                    print(f"   3. Press Enter when done...")
-                    input()
+            # Need manual login
+            print("\n⏸️  PLEASE LOGIN MANUALLY:")
+            print("   1. 👀 Look at the browser window that just opened")
+            print("   2. 🔑 Login to Jira manually")
+            print(f"      Email: {self.email}")
+            if 'microsoftonline' in current_url:
+                print("      (Microsoft SSO detected - use your Microsoft account)")
+            else:
+                print("      Use your Jira password or API token")
+            print("   3. ✅ Once you see your Jira dashboard (wait for it to fully load)")
+            print("   4. ⌨️  Come back here and press ENTER")
+            print("\n" + "="*70)
             
-            # Verify login
-            await self.page.goto(f"{self.jira_url}/jira/your-work", timeout=30000)
+            # Wait for user to login
+            input("Press ENTER after you've logged in and see the Jira dashboard... ")
+            
+            # Give extra time for page to load
+            print("\n⏳ Waiting for page to fully load...")
             await self.page.wait_for_timeout(3000)
             
-            if '/jira/' in self.page.url and '/login' not in self.page.url:
-                print("✅ Login successful!")
+            # Check current URL
+            current_url = self.page.url
+            print(f"📍 Current URL: {current_url}")
+            
+            # If still on login/SSO page, wait more
+            if '/login' in current_url or 'microsoftonline' in current_url or 'id.atlassian' in current_url:
+                print("\n⚠️  Still on login page. Waiting 5 more seconds...")
+                await self.page.wait_for_timeout(5000)
+                current_url = self.page.url
+            
+            # Try to navigate to Jira dashboard
+            print("\n🔍 Navigating to Jira dashboard...")
+            try:
+                await self.page.goto(f"{self.jira_url}/jira/your-work", timeout=30000, wait_until='domcontentloaded')
+                await self.page.wait_for_timeout(3000)
+                current_url = self.page.url
+            except Exception as e:
+                print(f"⚠️  Navigation warning: {e}")
+                # Continue anyway, user might be logged in
+            
+            # Final check
+            if '/jira/' in current_url and '/login' not in current_url and 'microsoftonline' not in current_url:
+                print("✅ Login verified! Continuing automation...")
                 self.is_logged_in = True
                 return True
             else:
-                print(f"⚠️ Login verification failed. URL: {self.page.url}")
-                return False
+                print(f"\n⚠️  URL doesn't look like Jira dashboard: {current_url}")
+                print("\nLet's try one more time...")
+                
+                # Give one more chance
+                input("Make sure you're on Jira dashboard, then press ENTER... ")
+                await self.page.wait_for_timeout(2000)
+                
+                current_url = self.page.url
+                if '/jira/' in current_url or 'atlassian.net' in current_url:
+                    print("✅ Looks good! Continuing...")
+                    self.is_logged_in = True
+                    return True
+                else:
+                    print(f"❌ Still not on Jira. Current URL: {current_url}")
+                    print("\n💡 TIP: Make sure you:")
+                    print("   1. Completed the login")
+                    print("   2. Passed any 2FA/verification")
+                    print("   3. Can see your Jira dashboard")
+                    return False
                 
         except Exception as e:
-            logger.error(f"Login failed: {e}")
+            logger.error(f"Login process failed: {e}")
             return False
     
     async def create_project_visual(self, project_key: str, project_name: str):
@@ -313,42 +323,49 @@ class JiraBrowserAutomation:
             return False
     
     async def create_assignment_visual(self, config: Dict[str, Any]):
-        """Create entire assignment visually"""
+        """Create entire assignment visually with MANUAL LOGIN"""
         try:
-            print("\n" + "="*60)
+            print("\n" + "="*70)
             print("  🎬 Visual Jira Automation Started")
-            print("="*60)
+            print("  (Manual Login Version)")
+            print("="*70)
             
             # Start browser if not started
             if not self.browser:
                 await self.start_browser(headless=False)
             
-            # Login
+            # Manual Login
             if not await self.login_to_jira():
                 return {"success": False, "error": "Login failed"}
             
             # Create projects
-            print("\n📁 STEP 1: Creating Projects")
+            print("\n" + "="*70)
+            print("  📁 STEP 1: Creating Projects")
+            print("="*70)
             for proj in config.get('projects', []):
                 await self.create_project_visual(proj['key'], proj['name'])
                 await self.page.wait_for_timeout(2000)
             
             # Create epics
-            print("\n📋 STEP 2: Creating Epics")
+            print("\n" + "="*70)
+            print("  📋 STEP 2: Creating Epics")
+            print("="*70)
             for epic in config.get('epics', []):
                 await self.create_epic_visual(epic['project'], epic['name'])
                 await self.page.wait_for_timeout(1500)
             
             # Create stories
-            print("\n📝 STEP 3: Creating Stories")
+            print("\n" + "="*70)
+            print("  📝 STEP 3: Creating Stories")
+            print("="*70)
             for story in config.get('stories', []):
                 await self.create_story_visual(story['project'], story['summary'])
                 await self.page.wait_for_timeout(1000)
             
-            print("\n" + "="*60)
+            print("\n" + "="*70)
             print("  ✅ Visual Automation Complete!")
-            print("="*60)
-            print("\n👀 Browser will stay open for 30 seconds...")
+            print("="*70)
+            print("\n👀 Browser will stay open for 30 seconds so you can verify...")
             await self.page.wait_for_timeout(30000)
             
             return {"success": True, "message": "Visual automation complete"}

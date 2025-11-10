@@ -274,7 +274,7 @@
 #             logger.error(f"Tool execution error: {e}", exc_info=True)
 #             return {"success": False, "error": str(e)}
 
-"""MCP Server implementation - Fixed for MCP 1.19.0+"""
+"""MCP Server implementation - Updated with GitHub and Vercel"""
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 from .tools import BrowserTool, AWSTool, SystemTool
@@ -282,6 +282,16 @@ try:
     from .tools import UniversalJiraAutomation
 except ImportError:
     UniversalJiraAutomation = None
+
+try:
+    from .tools import GitHubTool
+except ImportError:
+    GitHubTool = None
+
+try:
+    from .tools import VercelTool
+except ImportError:
+    VercelTool = None
 
 from .database import DatabaseManager
 import logging
@@ -302,6 +312,8 @@ class MCPServer:
         self.system = SystemTool()
         self.jira = None
         self.jira_visual = None  # Visual automation
+        self.github = None  # GitHub tool
+        self.vercel = None  # Vercel tool
         self.db = DatabaseManager()
         
         # Screenshot management
@@ -335,6 +347,22 @@ class MCPServer:
         except ImportError:
             logger.warning("Jira visual automation not available")
     
+    def configure_github(self, access_token: str):
+        """Configure GitHub"""
+        if GitHubTool:
+            self.github = GitHubTool(access_token)
+            logger.info("GitHub configured")
+        else:
+            logger.warning("GitHub tool not available")
+    
+    def configure_vercel(self, token: str = None):
+        """Configure Vercel"""
+        if VercelTool:
+            self.vercel = VercelTool(token)
+            logger.info("Vercel configured")
+        else:
+            logger.warning("Vercel tool not available")
+    
     def _init_screenshot_doc(self):
         """Initialize Word document for screenshots"""
         if not self.screenshot_doc:
@@ -366,8 +394,9 @@ class MCPServer:
     def _register_tools(self):
         """Register MCP tools"""
         
-        # Define all tools
+        # Define all tools (including new GitHub and Vercel tools)
         self.tools_list = [
+            # Browser tools
             Tool(
                 name="browser_navigate",
                 description="Navigate to a URL in the browser",
@@ -403,6 +432,8 @@ class MCPServer:
                     }
                 }
             ),
+            
+            # AWS tools
             Tool(
                 name="aws_create_bucket",
                 description="Create an AWS S3 bucket",
@@ -425,6 +456,8 @@ class MCPServer:
                     "properties": {}
                 }
             ),
+            
+            # File system tools
             Tool(
                 name="file_read",
                 description="Read contents of a file",
@@ -461,6 +494,8 @@ class MCPServer:
                     }
                 }
             ),
+            
+            # Jira tools
             Tool(
                 name="jira_create_assignment",
                 description="Create the complete College Event Management Jira assignment with all epics, stories, and tasks",
@@ -477,10 +512,9 @@ class MCPServer:
                     "properties": {}
                 }
             ),
-            # NEW: Jira with visual screenshots
             Tool(
                 name="jira_create_visual_with_screenshots",
-                description="Create Jira assignment VISUALLY with browser automation - takes screenshots at each step and creates Word document. Use this when user says 'take screenshots' or 'create word doc with screenshots'",
+                description="Create Jira assignment VISUALLY with browser automation - takes screenshots at each step and creates Word document",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -493,7 +527,7 @@ class MCPServer:
             ),
             Tool(
                 name="jira_create_visual",
-                description="Create Jira assignment VISUALLY using browser automation - watch it happen step by step (no screenshots)",
+                description="Create Jira assignment VISUALLY using browser automation - watch it happen step by step",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -505,10 +539,124 @@ class MCPServer:
                     "required": ["document_text"]
                 }
             ),
-            # NEW: Generic screenshot tools
+            
+            # GitHub tools (NEW)
+            Tool(
+                name="github_create_repo",
+                description="Create a new GitHub repository",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {
+                            "type": "string",
+                            "description": "Name of the repository to create"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Repository description (optional)"
+                        },
+                        "private": {
+                            "type": "boolean",
+                            "description": "Make repository private (default: false)"
+                        }
+                    },
+                    "required": ["repo_name"]
+                }
+            ),
+            Tool(
+                name="github_push_code",
+                description="Push local code to GitHub repository",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {
+                            "type": "string",
+                            "description": "Name of the repository"
+                        },
+                        "local_path": {
+                            "type": "string",
+                            "description": "Local path to push (default: current directory)"
+                        },
+                        "branch": {
+                            "type": "string",
+                            "description": "Branch name (default: main)"
+                        }
+                    },
+                    "required": ["repo_name"]
+                }
+            ),
+            Tool(
+                name="github_generate_readme",
+                description="Generate README.md file for the project based on structure",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "local_path": {
+                            "type": "string",
+                            "description": "Local path (default: current directory)"
+                        }
+                    }
+                }
+            ),
+            Tool(
+                name="github_build_and_push",
+                description="Complete workflow: Generate README, create repo, and push code to GitHub",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {
+                            "type": "string",
+                            "description": "Name of the repository"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Repository description (optional)"
+                        },
+                        "local_path": {
+                            "type": "string",
+                            "description": "Local path (default: current directory)"
+                        }
+                    },
+                    "required": ["repo_name"]
+                }
+            ),
+            
+            # Vercel tools (NEW)
+            Tool(
+                name="vercel_deploy",
+                description="Deploy project to Vercel",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "local_path": {
+                            "type": "string",
+                            "description": "Local path to deploy (default: current directory)"
+                        },
+                        "production": {
+                            "type": "boolean",
+                            "description": "Deploy to production (default: true)"
+                        }
+                    }
+                }
+            ),
+            Tool(
+                name="vercel_list_deployments",
+                description="List recent Vercel deployments",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Number of deployments to list (default: 5)"
+                        }
+                    }
+                }
+            ),
+            
+            # Screenshot tools
             Tool(
                 name="enable_screenshots",
-                description="Enable automatic screenshots for all subsequent actions. Screenshots will be saved to a Word document.",
+                description="Enable automatic screenshots for all subsequent actions",
                 inputSchema={
                     "type": "object",
                     "properties": {}
@@ -524,7 +672,7 @@ class MCPServer:
             ),
             Tool(
                 name="take_screenshot_and_save",
-                description="Take a screenshot of current browser page and add to Word document with a title",
+                description="Take a screenshot of current browser page and add to Word document",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -552,119 +700,24 @@ class MCPServer:
             logger.info(f"Tool called: {name} with args: {arguments}")
             
             try:
-                result = None
-                
-                # Browser tools
-                if name == "browser_navigate":
-                    result = await self.browser.navigate(arguments["url"])
-                    # Auto-screenshot if enabled
-                    if self.screenshot_enabled:
-                        await self._auto_screenshot(f"Navigated to: {arguments['url']}")
-                    
-                elif name == "youtube_play":
-                    result = await self.browser.play_youtube(arguments["query"])
-                    if self.screenshot_enabled:
-                        await self._auto_screenshot(f"Playing: {arguments['query']}")
-                    
-                elif name == "browser_screenshot":
-                    filename = arguments.get("filename", "screenshot.png")
-                    result = await self.browser.screenshot(filename)
-                
-                # AWS tools
-                elif name == "aws_create_bucket":
-                    if not self.aws:
-                        result = {"success": False, "error": "AWS not configured"}
-                    else:
-                        result = await self.aws.create_bucket(arguments["bucket_name"])
-                        
-                elif name == "aws_list_buckets":
-                    if not self.aws:
-                        result = {"success": False, "error": "AWS not configured"}
-                    else:
-                        result = await self.aws.list_buckets()
-                
-                # System tools
-                elif name == "file_read":
-                    result = await self.system.read_file(arguments["path"])
-                    
-                elif name == "file_write":
-                    result = await self.system.write_file(
-                        arguments["path"],
-                        arguments["content"]
-                    )
-                    
-                elif name == "list_directory":
-                    path = arguments.get("path", ".")
-                    result = await self.system.list_directory(path)
-                
-                # Jira tools
-                elif name == "jira_create_assignment":
-                    if not self.jira:
-                        result = {"success": False, "error": "Jira not configured"}
-                    else:
-                        result = await self.jira.create_complete_assignment()
-                        
-                elif name == "jira_create_projects":
-                    if not self.jira:
-                        result = {"success": False, "error": "Jira not configured"}
-                    else:
-                        result = await self.jira.create_projects()
-                
-                # NEW: Visual Jira with screenshots
-                elif name == "jira_create_visual_with_screenshots":
-                    result = await self._jira_visual_with_screenshots(arguments.get("document_path"))
-                
-                # Visual Jira (no screenshots)
-                elif name == "jira_create_visual":
-                    if not self.jira_visual:
-                        result = {"success": False, "error": "Jira visual automation not configured"}
-                    else:
-                        from .tools import DocumentParser
-                        parser = DocumentParser()
-                        parse_result = parser.parse_with_rules(arguments["document_text"])
-                        result = await self.jira_visual.create_assignment_visual(parse_result)
-                
-                # Screenshot management tools
-                elif name == "enable_screenshots":
-                    self.screenshot_enabled = True
-                    self._init_screenshot_doc()
-                    result = {"success": True, "message": "Screenshots enabled. All actions will be captured."}
-                
-                elif name == "disable_screenshots":
-                    self.screenshot_enabled = False
-                    doc_path = self._save_screenshot_doc()
-                    result = {"success": True, "message": f"Screenshots disabled. Document saved: {doc_path}", "data": {"doc_path": doc_path}}
-                
-                elif name == "take_screenshot_and_save":
-                    if not self.browser.page:
-                        result = {"success": False, "error": "Browser not started"}
-                    else:
-                        if not self.screenshot_doc:
-                            self._init_screenshot_doc()
-                        screenshot_path = await self._take_and_save_screenshot(arguments.get("title", "Screenshot"))
-                        result = {"success": True, "message": f"Screenshot saved: {screenshot_path}"}
-                
-                else:
-                    result = {"success": False, "error": f"Unknown tool: {name}"}
-                
-                # Log tool usage
-                self.db.log_tool_usage(name, result.get("success", False), 0)
+                result = await self.execute_tool(name, arguments)
                 
                 # Format response
                 if result.get("success"):
                     message = f"✅ {result.get('message', 'Success')}"
                     if result.get('data'):
-                        if 'title' in result['data']:
-                            message += f"\nTitle: {result['data']['title']}"
-                        if 'buckets' in result['data']:
-                            message += f"\nBuckets: {', '.join(result['data']['buckets'][:5])}"
-                        if 'files' in result['data']:
-                            message += f"\nFiles: {len(result['data']['files'])}"
-                        if 'content' in result['data']:
-                            content = result['data']['content'][:200]
-                            message += f"\nContent: {content}..."
-                        if 'doc_path' in result['data']:
-                            message += f"\n📄 Document: {result['data']['doc_path']}"
+                        data = result['data']
+                        # Format different data types
+                        if 'url' in data:
+                            message += f"\n🔗 URL: {data['url']}"
+                        if 'repo_url' in data:
+                            message += f"\n📦 Repository: {data['repo_url']}"
+                        if 'clone_url' in data:
+                            message += f"\n📥 Clone: {data['clone_url']}"
+                        if 'steps' in data:
+                            message += f"\n📋 Steps:\n" + "\n".join(data['steps'])
+                        if 'doc_path' in data:
+                            message += f"\n📄 Document: {data['doc_path']}"
                 else:
                     message = f"❌ Error: {result.get('error', 'Unknown error')}"
                 
@@ -853,11 +906,9 @@ class MCPServer:
                 else:
                     result = await self.jira.create_projects()
             
-            # Visual Jira with screenshots
             elif name == "jira_create_visual_with_screenshots":
                 result = await self._jira_visual_with_screenshots(arguments.get("document_path"))
             
-            # Visual Jira (no screenshots)
             elif name == "jira_create_visual":
                 if not self.jira_visual:
                     result = {"success": False, "error": "Jira visual automation not configured"}
@@ -866,6 +917,63 @@ class MCPServer:
                     parser = DocumentParser()
                     parse_result = parser.parse_with_rules(arguments["document_text"])
                     result = await self.jira_visual.create_assignment_visual(parse_result)
+            
+            # GitHub tools (NEW)
+            elif name == "github_create_repo":
+                if not self.github:
+                    result = {"success": False, "error": "GitHub not configured. Add GITHUB_TOKEN to .env"}
+                else:
+                    result = await self.github.create_repo(
+                        arguments["repo_name"],
+                        arguments.get("description", ""),
+                        arguments.get("private", False)
+                    )
+            
+            elif name == "github_push_code":
+                if not self.github:
+                    result = {"success": False, "error": "GitHub not configured. Add GITHUB_TOKEN to .env"}
+                else:
+                    result = await self.github.push_local_code(
+                        arguments["repo_name"],
+                        arguments.get("local_path", "."),
+                        arguments.get("branch", "main")
+                    )
+            
+            elif name == "github_generate_readme":
+                if not self.github:
+                    result = {"success": False, "error": "GitHub not configured. Add GITHUB_TOKEN to .env"}
+                else:
+                    result = await self.github.generate_readme(
+                        arguments.get("local_path", ".")
+                    )
+            
+            elif name == "github_build_and_push":
+                if not self.github:
+                    result = {"success": False, "error": "GitHub not configured. Add GITHUB_TOKEN to .env"}
+                else:
+                    result = await self.github.build_and_push_project(
+                        arguments["repo_name"],
+                        arguments.get("description", "MCP Automation Project"),
+                        arguments.get("local_path", ".")
+                    )
+            
+            # Vercel tools (NEW)
+            elif name == "vercel_deploy":
+                if not self.vercel:
+                    result = {"success": False, "error": "Vercel not configured"}
+                else:
+                    result = await self.vercel.deploy(
+                        arguments.get("local_path", "."),
+                        arguments.get("production", True)
+                    )
+            
+            elif name == "vercel_list_deployments":
+                if not self.vercel:
+                    result = {"success": False, "error": "Vercel not configured"}
+                else:
+                    result = await self.vercel.get_deployments(
+                        arguments.get("limit", 5)
+                    )
             
             # Screenshot tools
             elif name == "enable_screenshots":

@@ -188,7 +188,7 @@ async def main():
     print("\n📄 Step 1: Parsing assignment document...")
     parser = DocumentParser()
     
-    doc_path = 'documents/Assignment-11_Monday.docx'
+    doc_path = 'documents/Assignment-11 Monday.docx'
     if not Path(doc_path).exists():
         print(f"❌ Document not found: {doc_path}")
         print("Please check the path and try again.")
