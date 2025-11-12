@@ -63,6 +63,15 @@ try:
     from .vercel_tool import VercelTool
 except ImportError:
     VercelTool = None
+try:
+    from .figma_to_website_tool import FigmaToWebsiteTool
+except ImportError:
+    FigmaToWebsiteTool = None
+
+try:
+    from .document_generator_tool import DocumentGeneratorTool
+except ImportError:
+    DocumentGeneratorTool = None
 
 __all__ = [
     'BrowserTool',
@@ -73,4 +82,6 @@ __all__ = [
     'DocumentParser',
     'GitHubTool',
     'VercelTool',
+    'FigmaToWebsiteTool',
+    'DocumentGeneratorTool',
 ]

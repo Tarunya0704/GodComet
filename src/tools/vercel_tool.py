@@ -22,10 +22,11 @@ class VercelTool:
         """Check if Vercel CLI is installed"""
         try:
             result = subprocess.run(
-                ["vercel", "--version"],
+                "vercel --version",
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=5,
+                shell=True  # CRITICAL for Windows
             )
             return result.returncode == 0
         except Exception:
@@ -37,10 +38,11 @@ class VercelTool:
             logger.info("Installing Vercel CLI...")
             
             result = subprocess.run(
-                ["npm", "install", "-g", "vercel"],
+                "npm install -g vercel",
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=120,
+                shell=True  # CRITICAL for Windows
             )
             
             if result.returncode == 0:
@@ -143,19 +145,22 @@ class VercelTool:
                     logger.warning("Could not create vercel.json, continuing anyway...")
             
             # Build deployment command
-            cmd = ["vercel"]
+            cmd_parts = ["vercel"]
             
             if production:
-                cmd.append("--prod")
+                cmd_parts.append("--prod")
             
             # Add yes flag for non-interactive
-            cmd.append("--yes")
+            cmd_parts.append("--yes")
             
             # Set token if available
             if self.token:
-                cmd.extend(["--token", self.token])
+                cmd_parts.extend(["--token", self.token])
             
-            logger.info(f"Running: {' '.join(cmd)}")
+            # Join command for Windows
+            cmd = " ".join(cmd_parts)
+            
+            logger.info(f"Running: {cmd}")
             
             # Run deployment
             result = subprocess.run(
@@ -163,7 +168,8 @@ class VercelTool:
                 cwd=str(local_path),
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 minutes timeout
+                timeout=300,  # 5 minutes timeout
+                shell=True  # CRITICAL for Windows
             )
             
             if result.returncode == 0:
@@ -211,31 +217,58 @@ class VercelTool:
     async def get_deployments(self, limit: int = 5) -> Dict[str, Any]:
         """List recent deployments"""
         try:
-            cmd = ["vercel", "list", "--json"]
+            # First check if CLI is available
+            if not await self.check_vercel_cli():
+                return {
+                    "success": False,
+                    "error": "Vercel CLI not found. Install: npm install -g vercel"
+                }
+            
+            cmd_parts = ["vercel", "list", "--json"]
             
             if self.token:
-                cmd.extend(["--token", self.token])
+                cmd_parts.extend(["--token", self.token])
+            
+            # Join command for Windows
+            cmd = " ".join(cmd_parts)
             
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                shell=True  # CRITICAL for Windows
             )
             
             if result.returncode == 0:
-                deployments = json.loads(result.stdout)
-                
-                return {
-                    "success": True,
-                    "message": f"Found {len(deployments)} deployments",
-                    "data": {
-                        "deployments": deployments[:limit]
+                try:
+                    deployments = json.loads(result.stdout)
+                    return {
+                        "success": True,
+                        "message": f"Found {len(deployments)} deployments",
+                        "data": {
+                            "deployments": deployments[:limit]
+                        }
                     }
-                }
+                except json.JSONDecodeError:
+                    return {
+                        "success": False,
+                        "error": "Failed to parse deployment list"
+                    }
             else:
-                return {"success": False, "error": result.stderr}
+                error_msg = result.stderr or "Unknown error"
+                if "not found" in error_msg.lower() or "not recognized" in error_msg.lower():
+                    return {
+                        "success": False,
+                        "error": "Vercel CLI not found. Install: npm install -g vercel"
+                    }
+                return {"success": False, "error": error_msg}
                 
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "error": "Vercel CLI not found. Install: npm install -g vercel"
+            }
         except Exception as e:
             logger.error(f"Failed to get deployments: {e}")
             return {"success": False, "error": str(e)}

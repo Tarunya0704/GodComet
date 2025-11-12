@@ -111,7 +111,7 @@
 #!/usr/bin/env python3
 
 
-"""CLI Application - Main Entry Point - Updated with GitHub & Vercel"""
+"""CLI Application - Main Entry Point - COMPLETE VERSION with all features"""
 import asyncio
 import os
 import sys
@@ -275,7 +275,7 @@ async def handle_jira_visual_command(mcp, command):
 async def main():
     print("=" * 60)
     print("  ⚡ MCP AI Automation System - Groq AI")
-    print("  🚀 Ultra-Fast AI Inference")
+    print("  🚀 Ultra-Fast AI Inference + Advanced Features")
     print("=" * 60)
     print()
     
@@ -316,22 +316,37 @@ async def main():
     else:
         print("⚠️  Jira not configured (optional)")
     
-    # GitHub configuration (NEW)
+    # GitHub configuration
     if Config.is_github_configured():
         mcp.configure_github(Config.GITHUB_TOKEN)
         print(f"✅ GitHub configured")
     else:
         print("⚠️  GitHub not configured (optional - add GITHUB_TOKEN to .env)")
     
-    # Vercel configuration (NEW)
+    # Vercel configuration
     if Config.is_vercel_configured():
         mcp.configure_vercel(Config.VERCEL_TOKEN)
         print(f"✅ Vercel configured")
     else:
         print("⚠️  Vercel not configured (optional - add VERCEL_TOKEN to .env)")
     
+    # Figma configuration (NEW)
+    figma_token = Config.FIGMA_TOKEN if hasattr(Config, 'FIGMA_TOKEN') else None
+    if figma_token:
+        mcp.configure_figma(figma_token)
+        print(f"✅ Figma tool configured")
+    else:
+        mcp.configure_figma()  # Works without token (uses mock data)
+        print("⚠️  Figma tool configured (no token - will use mock data)")
+    
+    # Initialize AI client
     print("⚡ Initializing AI client with Groq (ultra-fast)...")
     ai = AIClient(Config.GROQ_API_KEY, mcp)
+    
+    # Document Generator configuration (NEW)
+    mcp.configure_document_generator(ai)
+    print(f"✅ Document Generator configured")
+    
     print("✅ System ready!")
     print()
     
@@ -348,6 +363,15 @@ async def main():
     print("   ▲ Vercel:")
     print("      • deploy this on vercel")
     print("      • list my vercel deployments")
+    print()
+    print("   🎨 Figma to Website:")
+    print("      • convert figma design to website [URL] project: my-site")
+    print("      • build website from figma [URL]")
+    print()
+    print("   📄 Document Generator:")
+    print("      • create project proposal for fitness app")
+    print("      • generate business plan for AI startup")
+    print("      • make presentation about machine learning")
     print()
     print("   📋 Jira:")
     print('      • complete jira assignment "documents\\Assignment.docx"')

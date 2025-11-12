@@ -292,6 +292,15 @@ try:
     from .tools import VercelTool
 except ImportError:
     VercelTool = None
+try:
+    from .tools import FigmaToWebsiteTool
+except ImportError:
+    FigmaToWebsiteTool = None
+
+try:
+    from .tools import DocumentGeneratorTool
+except ImportError:
+    DocumentGeneratorTool = None
 
 from .database import DatabaseManager
 import logging
@@ -314,6 +323,8 @@ class MCPServer:
         self.jira_visual = None  # Visual automation
         self.github = None  # GitHub tool
         self.vercel = None  # Vercel tool
+        self.figma = None  # Figma to Website tool
+        self.doc_gen = None  # Document generator tool
         self.db = DatabaseManager()
         
         # Screenshot management
@@ -362,6 +373,21 @@ class MCPServer:
             logger.info("Vercel configured")
         else:
             logger.warning("Vercel tool not available")
+    def configure_figma(self, token: str = None):
+        """Configure Figma"""
+        if FigmaToWebsiteTool:
+            self.figma = FigmaToWebsiteTool(token)
+            logger.info("Figma to Website tool configured")
+        else:
+            logger.warning("Figma tool not available")
+    
+    def configure_document_generator(self, ai_client=None):
+        """Configure Document Generator"""
+        if DocumentGeneratorTool:
+            self.doc_gen = DocumentGeneratorTool(ai_client)
+            logger.info("Document Generator configured")
+        else:
+            logger.warning("Document Generator not available")
     
     def _init_screenshot_doc(self):
         """Initialize Word document for screenshots"""
@@ -494,7 +520,52 @@ class MCPServer:
                     }
                 }
             ),
+             Tool(
+                name="figma_to_website",
+                description="Convert Figma design to complete deployed website with all files saved locally, GitHub repo, and Vercel deployment",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "figma_url": {
+                            "type": "string",
+                            "description": "Figma file URL (e.g., https://www.figma.com/file/...)"
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": "Name for the project"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Project description (optional)"
+                        }
+                    },
+                    "required": ["figma_url", "project_name"]
+                }
+            ),
             
+            # Document & Presentation Generator tools (NEW)
+            Tool(
+                name="create_document_and_presentation",
+                description="Generate professional Word document and PowerPoint presentation from natural language request with AI research. Saves all files locally.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "request": {
+                            "type": "string",
+                            "description": "What document to create (e.g., 'create project proposal for fitness app')"
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": "Project name (optional, auto-generated from request if not provided)"
+                        },
+                        "output_folder": {
+                            "type": "string",
+                            "description": "Custom output folder path (optional, uses 'documents/' by default)"
+                        }
+                    },
+                    "required": ["request"]
+                }
+            ),
             # Jira tools
             Tool(
                 name="jira_create_assignment",
@@ -963,8 +1034,8 @@ class MCPServer:
                     result = {"success": False, "error": "Vercel not configured"}
                 else:
                     result = await self.vercel.deploy(
-                        arguments.get("local_path", "."),
-                        arguments.get("production", True)
+                        arguments.get("local_path", ".") if arguments else ".",
+                        arguments.get("production", True) if arguments else True
                     )
             
             elif name == "vercel_list_deployments":
@@ -972,8 +1043,30 @@ class MCPServer:
                     result = {"success": False, "error": "Vercel not configured"}
                 else:
                     result = await self.vercel.get_deployments(
-                        arguments.get("limit", 5)
+                        arguments.get("limit", 5) if arguments else 5
                     )
+             # Figma to Website tools (NEW)
+            elif name == "figma_to_website":
+                if not self.figma:
+                    result = {"success": False, "error": "Figma tool not configured"}
+                else:
+                    result = await self.figma.create_website_from_figma(
+                        arguments["figma_url"],
+                        arguments["project_name"],
+                        arguments.get("description", "Website from Figma")
+                    )
+            
+            # Document Generator tools (NEW)
+            elif name == "create_document_and_presentation":
+                if not self.doc_gen:
+                    result = {"success": False, "error": "Document Generator not configured"}
+                else:
+                    result = await self.doc_gen.create_document_and_presentation(
+                        arguments["request"],
+                        arguments.get("project_name"),
+                        arguments.get("output_folder")
+                    )
+
             
             # Screenshot tools
             elif name == "enable_screenshots":

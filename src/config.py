@@ -29,6 +29,9 @@ class Config:
     # Vercel (optional - NEW)
     VERCEL_TOKEN = os.getenv("VERCEL_TOKEN")
     
+    # Figma (optional - NEW)
+    FIGMA_TOKEN = os.getenv("FIGMA_TOKEN")
+    
     @classmethod
     def validate(cls):
         """Validate required configuration"""
