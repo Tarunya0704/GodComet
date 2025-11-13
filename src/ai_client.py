@@ -353,20 +353,57 @@ Remember: Be helpful, flexible, and smart. Users don't know exact tool names!"""
                                 if result.get('data'):
                                     # Add important data
                                     data = result['data']
+                                    
+                                    # Video/YouTube data
                                     if 'title' in data:
                                         result_text += f"\nVideo Title: {data['title']}"
-                                    if 'url' in data:
-                                        result_text += f"\nURL: {data['url']}"
-                                    if 'repo_url' in data:
-                                        result_text += f"\nRepository: {data['repo_url']}"
+                                    
+                                    # Website/Deployment URLs (PROMINENT DISPLAY)
+                                    if 'vercel_url' in data and data['vercel_url']:
+                                        result_text += f"\n\n{'='*60}"
+                                        result_text += f"\n🌐 LIVE WEBSITE: {data['vercel_url']}"
+                                        result_text += f"\n{'='*60}"
+                                        result_text += f"\n✨ Your website is now live! Click the link above to visit."
+                                    
+                                    # GitHub URLs
+                                    if 'github_url' in data and data['github_url']:
+                                        result_text += f"\n\n📦 GitHub Repository: {data['github_url']}"
+                                    if 'repo_url' in data and data['repo_url']:
+                                        result_text += f"\n📦 Repository: {data['repo_url']}"
+                                    
+                                    # Local paths
+                                    if 'local_path' in data:
+                                        result_text += f"\n📁 Local Files: {data['local_path']}"
+                                    
+                                    # Document files
+                                    if 'word_document' in data:
+                                        result_text += f"\n📄 Word Document: {data['word_document']}"
+                                    if 'powerpoint' in data:
+                                        result_text += f"\n📊 PowerPoint: {data['powerpoint']}"
+                                    
+                                    # Project info
+                                    if 'project_name' in data:
+                                        result_text += f"\n🏷️  Project: {data['project_name']}"
+                                    
+                                    # Other URLs
+                                    if 'url' in data and 'vercel_url' not in data:
+                                        result_text += f"\n🔗 URL: {data['url']}"
+                                    
+                                    # Deployments list
                                     if 'deployments' in data:
-                                        result_text += f"\nDeployments: {len(data['deployments'])}"
+                                        result_text += f"\n\n📋 Deployments: {len(data['deployments'])}"
                                         for dep in data['deployments'][:3]:  # Show first 3
                                             result_text += f"\n  • {dep.get('name', 'Unknown')}: {dep.get('url', 'N/A')}"
+                                    
+                                    # AWS buckets
                                     if 'buckets' in data:
                                         result_text += f"\nBuckets: {', '.join(data['buckets'][:5])}"
-                                    if 'files' in data:
-                                        result_text += f"\nFiles found: {len(data['files'])}"
+                                    
+                                    # Files
+                                    if 'files' in data and isinstance(data['files'], list):
+                                        result_text += f"\n📂 Files Created: {len(data['files'])} files"
+                                    
+                                    # Content preview
                                     if 'content' in data:
                                         content_preview = data['content'][:200]
                                         result_text += f"\nContent preview: {content_preview}..."

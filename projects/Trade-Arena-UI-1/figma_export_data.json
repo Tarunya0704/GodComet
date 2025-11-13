@@ -1,0 +1,12 @@
+{
+  "name": "Design File",
+  "document": {
+    "children": [
+      {
+        "name": "Landing Page",
+        "type": "FRAME",
+        "children": []
+      }
+    ]
+  }
+}
