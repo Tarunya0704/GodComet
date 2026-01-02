@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GodComet</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header with Logo and Context -->
+        <div class="header">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <span class="logo-text">GodComet</span>
+            </div>
+            
+            <!-- Context Pills -->
+            <div class="context-pills">
+                <div class="context-pill" id="contextAppPill">
+                    <span class="pill-icon">📱</span>
+                    <span id="contextApp">Unknown</span>
+                </div>
+                <div class="context-pill" id="contextFilePill">
+                    <span class="pill-icon">📄</span>
+                    <span id="contextFile">No file</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Input Area -->
+        <div class="input-container">
+            <div class="input-wrapper">
+                <span class="input-icon">✨</span>
+                <input 
+                    type="text" 
+                    id="commandInput" 
+                    class="command-input"
+                    placeholder="What would you like to do?"
+                    autocomplete="off"
+                    spellcheck="false"
+                />
+                <div class="input-actions">
+                    <button class="action-btn" id="historyBtn" title="History">
+                        📜
+                    </button>
+                    <button class="action-btn" id="workflowBtn" title="Workflows">
+                        🔄
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Quick Actions -->
+            <div class="quick-actions">
+                <button class="quick-action" data-command="what file am i editing">
+                    📝 Current File
+                </button>
+                <button class="quick-action" data-command="list workflows">
+                    🔄 Workflows
+                </button>
+                <button class="quick-action" data-command="list vercel deployments">
+                    🚀 Deployments
+                </button>
+            </div>
+        </div>
+
+        <!-- Progress Section -->
+        <div id="progressSection" class="progress-section hidden">
+            <div class="progress-header">
+                <span class="progress-title">Processing...</span>
+                <span class="progress-percentage" id="progressPercentage">0%</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-steps" id="progressSteps"></div>
+        </div>
+
+        <!-- Result Section -->
+        <div id="resultSection" class="result-section hidden">
+            <div class="result-header">
+                <span class="result-icon" id="resultIcon">✅</span>
+                <span class="result-title" id="resultTitle">Success</span>
+                <button class="close-btn" id="closeResult">✕</button>
+            </div>
+            <div class="result-content" id="resultContent"></div>
+            <div class="result-actions" id="resultActions"></div>
+        </div>
+
+        <!-- History Panel -->
+        <div id="historyPanel" class="side-panel hidden">
+            <div class="panel-header">
+                <h3>Recent Commands</h3>
+                <button class="close-btn" id="closeHistory">✕</button>
+            </div>
+            <div class="panel-content" id="historyList">
+                <div class="empty-state">
+                    <span class="empty-icon">📜</span>
+                    <p>No history yet</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Workflows Panel -->
+        <div id="workflowPanel" class="side-panel hidden">
+            <div class="panel-header">
+                <h3>Available Workflows</h3>
+                <button class="close-btn" id="closeWorkflow">✕</button>
+            </div>
+            <div class="panel-content" id="workflowList">
+                <div class="workflow-card" data-workflow="figma_to_production">
+                    <div class="workflow-icon">🎨</div>
+                    <div class="workflow-info">
+                        <h4>Figma to Production</h4>
+                        <p>Design → Code → GitHub → Vercel</p>
+                    </div>
+                </div>
+                <div class="workflow-card" data-workflow="document_code">
+                    <div class="workflow-icon">📚</div>
+                    <div class="workflow-info">
+                        <h4>Document Code</h4>
+                        <p>Generate comprehensive documentation</p>
+                    </div>
+                </div>
+                <div class="workflow-card" data-workflow="setup_project">
+                    <div class="workflow-icon">🚀</div>
+                    <div class="workflow-info">
+                        <h4>Setup Project</h4>
+                        <p>Create repo and initialize structure</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Keyboard Hint -->
+        <div class="keyboard-hint">
+            Press <kbd>Esc</kbd> to close
+        </div>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

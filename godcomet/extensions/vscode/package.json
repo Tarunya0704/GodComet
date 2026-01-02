@@ -1,0 +1,55 @@
+{
+  "name": "godcomet-vscode",
+  "displayName": "GodComet",
+  "description": "Connect VS Code to GodComet AI assistant",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": ["*"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "godcomet.connect",
+        "title": "GodComet: Connect"
+      },
+      {
+        "command": "godcomet.disconnect",
+        "title": "GodComet: Disconnect"
+      }
+    ],
+    "configuration": {
+      "title": "GodComet",
+      "properties": {
+        "godcomet.serverPort": {
+          "type": "number",
+          "default": 8765,
+          "description": "WebSocket server port"
+        },
+        "godcomet.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically connect on startup"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.130",
+    "@types/vscode": "^1.106.1",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@types/ws": "^8.18.1",
+    "ws": "^8.18.3"
+  }
+}

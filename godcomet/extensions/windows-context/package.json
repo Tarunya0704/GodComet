@@ -1,0 +1,14 @@
+{
+  "name": "godcomet-windows-context",
+  "version": "1.0.0",
+  "description": "System-wide Windows context detection",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "active-win": "^8.1.0",
+    "node-powershell": "^5.0.1"
+  }
+}

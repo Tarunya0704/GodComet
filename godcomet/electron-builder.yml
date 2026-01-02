@@ -1,0 +1,24 @@
+appId: com.godcomet.app
+productName: GodComet
+directories:
+  output: dist
+  buildResources: assets
+files:
+  - dist/**/*
+  - package.json
+mac:
+  category: public.app-category.productivity
+  icon: assets/icon.icns
+  target:
+    - dmg
+    - zip
+win:
+  icon: assets/icon.ico
+  target:
+    - nsis
+    - portable
+linux:
+  icon: assets/icon.png
+  target:
+    - AppImage
+    - deb
