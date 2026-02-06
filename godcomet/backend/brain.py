@@ -1,21 +1,33 @@
 """
 GodComet Backend - Connects Electron to MCP Automation
-WITH FULL CONTEXT AWARENESS + Code Analysis + Web Scraping
+WITH FULL CONTEXT AWARENESS + Code Analysis + Web Scraping + Real-time Workflows
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional, List
 import sys
 from pathlib import Path
 import os
+import asyncio
 from dotenv import load_dotenv
 import logging
+
+# Import workflow components
+from websocket_server import workflow_ws_server, WorkflowProgress
+from workflow_state_machine import workflow_manager, WorkflowState
+from workflow_executor import workflow_executor
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# Load environment variables from mcp-automation/.env (where the tokens are)
+mcp_env_path = Path(__file__).parent.parent.parent / "mcp-automation" / ".env"
+load_dotenv(dotenv_path=mcp_env_path)
+logger.info(f"🔑 Loading environment from: {mcp_env_path}")
+
+# Also try local .env as fallback
 load_dotenv()
 
 # Add mcp-automation/src to path
@@ -62,6 +74,18 @@ ai_client_instance: AIClient = None
 class CommandRequest(BaseModel):
     command: str
     context: dict = {}
+
+
+class WorkflowRequest(BaseModel):
+    """Request to start a Figma-to-production workflow"""
+    figma_url: str
+    project_name: Optional[str] = None
+
+
+class ApprovalRequest(BaseModel):
+    """Approval or rejection of a workflow"""
+    approved: bool
+    requested_changes: Optional[List[str]] = None
 
 @app.on_event("startup")
 async def startup():
@@ -149,8 +173,17 @@ async def startup():
         logger.info("   • Document & presentation generation")
         logger.info("   • Workflow automation")
         logger.info("   • Browser automation")
+        logger.info("   • Real-time workflow updates (WebSocket)")
         logger.info("=" * 60)
-        
+
+        # Start WebSocket server for real-time workflow updates
+        logger.info("🔌 Starting WebSocket server on port 8002...")
+        asyncio.create_task(workflow_ws_server.start(port=8002))
+
+        # Connect workflow manager to WebSocket server
+        workflow_manager.set_websocket_server(workflow_ws_server)
+        logger.info("✅ WebSocket server started for real-time updates")
+
     except Exception as e:
         logger.error(f"❌ Startup failed: {e}", exc_info=True)
         raise
@@ -381,16 +414,165 @@ async def get_features():
         }
     }
 
+# =============================================================================
+# WORKFLOW ENDPOINTS - Real-time Figma-to-Production Pipeline
+# =============================================================================
+
+@app.post("/workflow/start")
+async def start_workflow(request: WorkflowRequest):
+    """Start a new Figma-to-production workflow and execute the full pipeline"""
+    try:
+        logger.info(f"🚀 Starting workflow for: {request.figma_url}")
+
+        # Start workflow execution (runs in background)
+        workflow = await workflow_executor.start_workflow(
+            figma_url=request.figma_url,
+            project_name=request.project_name
+        )
+
+        # Return workflow ID for tracking
+        return {
+            "success": True,
+            "workflow_id": workflow.id,
+            "message": f"Workflow started: {workflow.id}",
+            "websocket_url": "ws://localhost:8002",
+            "project_name": workflow.project_name
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to start workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/workflow/{workflow_id}")
+async def get_workflow_status(workflow_id: str):
+    """Get current workflow status"""
+    workflow = workflow_manager.get_workflow(workflow_id)
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+    return workflow.to_dict()
+
+
+@app.post("/workflow/{workflow_id}/approve")
+async def approve_workflow(workflow_id: str):
+    """Approve workflow and continue to deployment"""
+    workflow = workflow_manager.get_workflow(workflow_id)
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+    if workflow.state != WorkflowState.AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Workflow is not awaiting approval (current state: {workflow.state.value})"
+        )
+
+    # Transition to deploying
+    await workflow_manager.transition(
+        workflow,
+        WorkflowState.DEPLOYING,
+        step_name="Creating GitHub repo",
+        progress=70,
+        message="Deploying to production..."
+    )
+
+    workflow.approval_status = "approved"
+
+    return {
+        "success": True,
+        "message": "Workflow approved, deploying...",
+        "workflow_id": workflow_id
+    }
+
+
+@app.post("/workflow/{workflow_id}/reject")
+async def reject_workflow(workflow_id: str, request: ApprovalRequest):
+    """Reject workflow and request changes"""
+    workflow = workflow_manager.get_workflow(workflow_id)
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+    if workflow.state != WorkflowState.AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Workflow is not awaiting approval (current state: {workflow.state.value})"
+        )
+
+    # Transition to regenerating
+    await workflow_manager.transition(
+        workflow,
+        WorkflowState.REGENERATING,
+        step_name="Applying changes",
+        progress=40,
+        message="Regenerating with requested changes..."
+    )
+
+    workflow.approval_status = "rejected"
+
+    return {
+        "success": True,
+        "message": "Workflow rejected, regenerating...",
+        "workflow_id": workflow_id,
+        "requested_changes": request.requested_changes
+    }
+
+
+@app.delete("/workflow/{workflow_id}")
+async def cancel_workflow(workflow_id: str):
+    """Cancel a workflow"""
+    workflow = workflow_manager.get_workflow(workflow_id)
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+    await workflow_manager.transition(
+        workflow,
+        WorkflowState.CANCELLED,
+        message="Workflow cancelled by user"
+    )
+
+    return {
+        "success": True,
+        "message": "Workflow cancelled",
+        "workflow_id": workflow_id
+    }
+
+
+@app.get("/workflows")
+async def list_workflows():
+    """List all workflows"""
+    return {
+        "workflows": workflow_manager.get_all_workflows(),
+        "active_count": len(workflow_manager.get_active_workflows())
+    }
+
+
+@app.get("/workflows/active")
+async def list_active_workflows():
+    """List active (in-progress) workflows"""
+    return {
+        "workflows": workflow_manager.get_active_workflows()
+    }
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
 if __name__ == "__main__":
     import uvicorn
-    
+
     logger.info("=" * 60)
     logger.info("🚀 GodComet Backend - Full-Featured AI Assistant")
     logger.info("=" * 60)
-    logger.info("📡 Starting server on http://localhost:8001")
-    logger.info("💡 Make sure your Electron app connects to this URL")
+    logger.info("📡 REST API: http://localhost:8001")
+    logger.info("🔌 WebSocket: ws://localhost:8002")
+    logger.info("💡 Make sure your Electron app connects to these URLs")
     logger.info("=" * 60)
-    
+
     uvicorn.run(
         app,
         host="0.0.0.0",

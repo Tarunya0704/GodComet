@@ -423,9 +423,11 @@ const BACKEND_URL = 'http://127.0.0.1:8001';
 const contextDetector = new UniversalContextDetector();
 
 let mainWindow = null;
+let previewWindow = null; // NEW: Preview window for Figma comparison
 let vscodeWS = null;
 let chromeWS = null;
 let windowsWS = null; // ⭐ NEW: Windows context WebSocket
+let workflowWS = null; // NEW: Workflow WebSocket for real-time updates
 let vscodeServer = null;
 let chromeServer = null;
 
@@ -591,6 +593,97 @@ function connectToWindowsContext() {
   });
 }
 
+// NEW: Connect to Workflow WebSocket server for real-time updates
+function connectToWorkflowServer() {
+  console.log('🔌 Connecting to Workflow WebSocket server...');
+
+  workflowWS = new WebSocket('ws://localhost:8002');
+
+  workflowWS.on('open', () => {
+    console.log('✅ Workflow WebSocket server connected');
+  });
+
+  workflowWS.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+
+      // Forward to renderer
+      if (mainWindow && mainWindow.webContents) {
+        if (message.type === 'progress') {
+          mainWindow.webContents.send('workflow-progress', message);
+          console.log(`📊 Workflow ${message.workflow_id}: ${message.data?.step} (${message.data?.progress}%)`);
+        }
+
+        if (message.type === 'approval_required') {
+          mainWindow.webContents.send('approval-required', message);
+          console.log(`🔔 Approval required for workflow: ${message.workflow_id}`);
+          // Show preview window
+          createPreviewWindow(message.preview);
+        }
+
+        if (message.type === 'complete') {
+          mainWindow.webContents.send('workflow-complete', message);
+          console.log(`✅ Workflow ${message.workflow_id} complete!`);
+          if (previewWindow) {
+            previewWindow.webContents.send('workflow-complete', message);
+          }
+        }
+
+        if (message.type === 'error') {
+          mainWindow.webContents.send('workflow-error', message);
+          console.log(`❌ Workflow ${message.workflow_id} error: ${message.error?.message}`);
+        }
+      }
+    } catch (error) {
+      console.error('Workflow message error:', error);
+    }
+  });
+
+  workflowWS.on('close', () => {
+    console.log('⚠️  Workflow WebSocket disconnected - will retry in 5s');
+    workflowWS = null;
+    setTimeout(connectToWorkflowServer, 5000);
+  });
+
+  workflowWS.on('error', (error) => {
+    console.error('❌ Workflow WebSocket error:', error.message);
+    console.log('💡 Make sure backend is running: cd backend && python brain.py');
+  });
+}
+
+// NEW: Create preview window for Figma vs Generated comparison
+function createPreviewWindow(previewData) {
+  if (previewWindow) {
+    previewWindow.focus();
+    previewWindow.webContents.send('preview-data', previewData);
+    return;
+  }
+
+  previewWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    frame: true,
+    title: 'GodComet Preview - Figma vs Generated',
+    backgroundColor: '#0a0a0f',
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
+    }
+  });
+
+  previewWindow.loadFile(path.join(__dirname, 'src/renderer/preview.html'));
+
+  previewWindow.on('ready-to-show', () => {
+    previewWindow.show();
+    previewWindow.webContents.send('preview-data', previewData);
+  });
+
+  previewWindow.on('closed', () => {
+    previewWindow = null;
+  });
+}
+
 async function getCurrentContext() {
   try {
     // Use universal context detector
@@ -693,7 +786,10 @@ app.whenReady().then(() => {
   
   // ⭐ NEW: Connect to Windows Context Tracker
   connectToWindowsContext();
-  
+
+  // NEW: Connect to Workflow WebSocket server
+  connectToWorkflowServer();
+
   // Test backend connection
   testBackendConnection();
   
@@ -720,7 +816,49 @@ app.whenReady().then(() => {
   ipcMain.handle('execute-command', async (event, command) => {
     try {
       console.log(`\n🎯 Executing: ${command}`);
-      
+
+      // Check if command contains a Figma URL
+      const figmaUrlMatch = command.match(/(?:https?:\/\/)?(?:www\.)?figma\.com\/(?:file|design|proto)\/([a-zA-Z0-9]+)/i);
+
+      if (figmaUrlMatch) {
+        // Extract Figma URL
+        let figmaUrl = figmaUrlMatch[0];
+        if (!figmaUrl.startsWith('http')) {
+          figmaUrl = 'https://' + figmaUrl;
+        }
+
+        console.log(`🎨 Detected Figma URL: ${figmaUrl}`);
+        console.log('🚀 Starting Figma-to-Production workflow...');
+
+        // Extract project name from command or generate one
+        const projectNameMatch = command.match(/(?:name|project|called?)\s+["\']?([a-zA-Z0-9_-]+)["\']?/i);
+        const projectName = projectNameMatch ? projectNameMatch[1] : null;
+
+        // Start workflow via workflow endpoint
+        const response = await axios.post(`${BACKEND_URL}/workflow/start`, {
+          figma_url: figmaUrl,
+          project_name: projectName
+        }, {
+          timeout: 30000
+        });
+
+        console.log('✅ Workflow started:', response.data.workflow_id);
+
+        return {
+          success: true,
+          message: `Figma workflow started! ID: ${response.data.workflow_id}`,
+          data: {
+            workflow_id: response.data.workflow_id,
+            project_name: response.data.project_name,
+            figma_url: figmaUrl
+          },
+          actions: [
+            { type: 'workflow_started', description: 'Converting Figma design to production code', status: 'running' }
+          ],
+          isWorkflow: true
+        };
+      }
+
       // Get full context (including Windows)
       const context = await getCurrentContext();
       console.log('📍 Context:', JSON.stringify({
@@ -731,7 +869,7 @@ app.whenReady().then(() => {
         selectedFiles: context.selectedFiles?.length || 0,
         hasSelection: !!context.selectedText
       }, null, 2));
-      
+
       // Send to backend with context
       const response = await axios.post(`${BACKEND_URL}/execute`, {
         command,
@@ -739,7 +877,7 @@ app.whenReady().then(() => {
       }, {
         timeout: 120000 // 2 minute timeout
       });
-      
+
       console.log('✅ Command executed successfully\n');
       return response.data;
       
@@ -871,6 +1009,132 @@ app.whenReady().then(() => {
     // TODO: Implement integration configuration
     return { success: true };
   });
+
+  // ============================================================================
+  // WORKFLOW IPC HANDLERS - Real-time Figma-to-Production Pipeline
+  // ============================================================================
+
+  // Start a Figma workflow
+  ipcMain.handle('start-workflow', async (event, figmaUrl, projectName) => {
+    try {
+      console.log(`🚀 Starting workflow for: ${figmaUrl}`);
+
+      const response = await axios.post(`${BACKEND_URL}/workflow/start`, {
+        figma_url: figmaUrl,
+        project_name: projectName
+      }, { timeout: 30000 });
+
+      return response.data;
+    } catch (error) {
+      console.error('Failed to start workflow:', error.message);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  });
+
+  // Get workflow status
+  ipcMain.handle('get-workflow-status', async (event, workflowId) => {
+    try {
+      const response = await axios.get(`${BACKEND_URL}/workflow/${workflowId}`, { timeout: 10000 });
+      return response.data;
+    } catch (error) {
+      console.error('Failed to get workflow status:', error.message);
+      return { error: error.message };
+    }
+  });
+
+  // Approve workflow
+  ipcMain.handle('approve-workflow', async (event, workflowId) => {
+    try {
+      console.log(`✅ Approving workflow: ${workflowId}`);
+
+      // Send via WebSocket for faster response
+      if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+        workflowWS.send(JSON.stringify({
+          type: 'approval_response',
+          workflow_id: workflowId,
+          approved: true
+        }));
+      }
+
+      // Also call REST endpoint
+      const response = await axios.post(`${BACKEND_URL}/workflow/${workflowId}/approve`, {}, { timeout: 30000 });
+      return response.data;
+    } catch (error) {
+      console.error('Failed to approve workflow:', error.message);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Reject workflow
+  ipcMain.handle('reject-workflow', async (event, workflowId, requestedChanges) => {
+    try {
+      console.log(`❌ Rejecting workflow: ${workflowId}`);
+
+      // Send via WebSocket
+      if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+        workflowWS.send(JSON.stringify({
+          type: 'approval_response',
+          workflow_id: workflowId,
+          approved: false,
+          requested_changes: requestedChanges || []
+        }));
+      }
+
+      // Also call REST endpoint
+      const response = await axios.post(`${BACKEND_URL}/workflow/${workflowId}/reject`, {
+        approved: false,
+        requested_changes: requestedChanges || []
+      }, { timeout: 30000 });
+
+      return response.data;
+    } catch (error) {
+      console.error('Failed to reject workflow:', error.message);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Cancel workflow
+  ipcMain.handle('cancel-workflow', async (event, workflowId) => {
+    try {
+      console.log(`🛑 Cancelling workflow: ${workflowId}`);
+
+      if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+        workflowWS.send(JSON.stringify({
+          type: 'cancel',
+          workflow_id: workflowId
+        }));
+      }
+
+      const response = await axios.delete(`${BACKEND_URL}/workflow/${workflowId}`, { timeout: 10000 });
+      return response.data;
+    } catch (error) {
+      console.error('Failed to cancel workflow:', error.message);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // List workflows
+  ipcMain.handle('list-workflows', async () => {
+    try {
+      const response = await axios.get(`${BACKEND_URL}/workflows`, { timeout: 10000 });
+      return response.data;
+    } catch (error) {
+      console.error('Failed to list workflows:', error.message);
+      return { workflows: [], error: error.message };
+    }
+  });
+
+  // Close preview window
+  ipcMain.handle('close-preview', () => {
+    if (previewWindow) {
+      previewWindow.close();
+      previewWindow = null;
+    }
+    return { success: true };
+  });
 });
 
 async function testBackendConnection() {
@@ -890,7 +1154,9 @@ app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   if (vscodeServer) vscodeServer.close();
   if (chromeServer) chromeServer.close();
-  if (windowsWS) windowsWS.close(); // ⭐ NEW
+  if (windowsWS) windowsWS.close();
+  if (workflowWS) workflowWS.close(); // NEW: Close workflow WebSocket
+  if (previewWindow) previewWindow.close(); // NEW: Close preview window
 });
 
 app.on('window-all-closed', () => {
