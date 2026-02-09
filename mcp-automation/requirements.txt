@@ -3,8 +3,17 @@ mcp>=1.0.0
 groq>=0.4.0
 python-dotenv>=1.0.0
 
+# Vision Models (for Visual Auditor)
+openai>=1.59.0
+anthropic>=0.42.0
+
 # Browser automation
 playwright>=1.40.0
+
+# Image Processing (for Visual Auditor)
+scikit-image>=0.24.0
+opencv-python>=4.9.0
+numpy>=1.24.0
 
 # Document processing
 python-docx>=1.1.0
@@ -22,6 +31,9 @@ jira>=3.5.0
 
 # Web requests
 requests>=2.31.0
+
+# WebSocket server (for real-time workflow updates)
+websockets>=12.0
 
 # Database
 # sqlite3 is built-in

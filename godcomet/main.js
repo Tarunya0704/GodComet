@@ -607,32 +607,41 @@ function connectToWorkflowServer() {
     try {
       const message = JSON.parse(data.toString());
 
-      // Forward to renderer
-      if (mainWindow && mainWindow.webContents) {
+      // Forward progress to main window renderer (if available)
+      if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
         if (message.type === 'progress') {
           mainWindow.webContents.send('workflow-progress', message);
-          console.log(`📊 Workflow ${message.workflow_id}: ${message.data?.step} (${message.data?.progress}%)`);
         }
-
         if (message.type === 'approval_required') {
           mainWindow.webContents.send('approval-required', message);
-          console.log(`🔔 Approval required for workflow: ${message.workflow_id}`);
-          // Show preview window
-          createPreviewWindow(message.preview);
         }
-
         if (message.type === 'complete') {
           mainWindow.webContents.send('workflow-complete', message);
-          console.log(`✅ Workflow ${message.workflow_id} complete!`);
-          if (previewWindow) {
-            previewWindow.webContents.send('workflow-complete', message);
-          }
         }
-
         if (message.type === 'error') {
           mainWindow.webContents.send('workflow-error', message);
-          console.log(`❌ Workflow ${message.workflow_id} error: ${message.error?.message}`);
         }
+      }
+
+      // Handle preview window and approval - OUTSIDE mainWindow guard
+      if (message.type === 'progress') {
+        console.log(`📊 Workflow ${message.workflow_id}: ${message.data?.step} (${message.data?.progress}%)`);
+      }
+
+      if (message.type === 'approval_required') {
+        console.log(`🔔 Approval required for workflow: ${message.workflow_id}`);
+        createPreviewWindow(message);
+      }
+
+      if (message.type === 'complete') {
+        console.log(`✅ Workflow ${message.workflow_id} complete!`);
+        if (previewWindow && !previewWindow.isDestroyed()) {
+          previewWindow.webContents.send('workflow-complete', message);
+        }
+      }
+
+      if (message.type === 'error') {
+        console.log(`❌ Workflow ${message.workflow_id} error: ${message.error?.message}`);
       }
     } catch (error) {
       console.error('Workflow message error:', error);
@@ -652,16 +661,17 @@ function connectToWorkflowServer() {
 }
 
 // NEW: Create preview window for Figma vs Generated comparison
-function createPreviewWindow(previewData) {
-  if (previewWindow) {
+function createPreviewWindow(messageData) {
+  if (previewWindow && !previewWindow.isDestroyed()) {
     previewWindow.focus();
-    previewWindow.webContents.send('preview-data', previewData);
+    previewWindow.webContents.send('preview-data', messageData);
     return;
   }
 
   previewWindow = new BrowserWindow({
     width: 1400,
     height: 900,
+    show: false,
     frame: true,
     title: 'GodComet Preview - Figma vs Generated',
     backgroundColor: '#0a0a0f',
@@ -674,9 +684,11 @@ function createPreviewWindow(previewData) {
 
   previewWindow.loadFile(path.join(__dirname, 'src/renderer/preview.html'));
 
-  previewWindow.on('ready-to-show', () => {
+  // Wait for page to fully load before sending data
+  previewWindow.webContents.on('did-finish-load', () => {
+    console.log('📺 Preview window loaded, sending data...');
     previewWindow.show();
-    previewWindow.webContents.send('preview-data', previewData);
+    previewWindow.webContents.send('preview-data', messageData);
   });
 
   previewWindow.on('closed', () => {

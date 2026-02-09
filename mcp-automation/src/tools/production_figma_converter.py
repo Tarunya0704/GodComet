@@ -225,10 +225,17 @@ class TailwindConverter:
                 if border_class:
                     classes.append(border_class)
         
-        # Border radius
+        # Border radius - use exact pixel values
         if node.corner_radius > 0:
-            radius = TailwindConverter._size_to_tailwind(node.corner_radius, "rounded")
-            classes.append(radius)
+            cr = int(round(node.corner_radius))
+            radius_map = {2: "rounded-sm", 4: "rounded", 6: "rounded-md", 8: "rounded-lg",
+                         12: "rounded-xl", 16: "rounded-2xl", 24: "rounded-3xl"}
+            if cr >= 9999:
+                classes.append("rounded-full")
+            elif cr in radius_map:
+                classes.append(radius_map[cr])
+            else:
+                classes.append(f"rounded-[{cr}px]")
         
         return classes
     
@@ -240,25 +247,19 @@ class TailwindConverter:
         
         classes = []
         style = node.style
-        
-        # Font size
+
+        # Font size - use exact values
         size = style.get("fontSize", 16)
-        if size <= 12:
-            classes.append("text-xs")
-        elif size <= 14:
-            classes.append("text-sm")
-        elif size <= 16:
-            classes.append("text-base")
-        elif size <= 18:
-            classes.append("text-lg")
-        elif size <= 20:
-            classes.append("text-xl")
-        elif size <= 24:
-            classes.append("text-2xl")
-        elif size <= 30:
-            classes.append("text-3xl")
+        font_size_map = {
+            10: "text-[10px]", 11: "text-[11px]", 12: "text-xs", 13: "text-[13px]",
+            14: "text-sm", 15: "text-[15px]", 16: "text-base", 18: "text-lg",
+            20: "text-xl", 24: "text-2xl", 30: "text-3xl", 36: "text-4xl",
+            48: "text-5xl", 60: "text-6xl", 72: "text-7xl"
+        }
+        if size in font_size_map:
+            classes.append(font_size_map[size])
         else:
-            classes.append("text-4xl")
+            classes.append(f"text-[{int(size)}px]")
         
         # Font weight
         weight = style.get("fontWeight", 400)
@@ -282,6 +283,28 @@ class TailwindConverter:
         elif align == "JUSTIFIED":
             classes.append("text-justify")
         
+        # Line height
+        line_height = style.get("lineHeightPx")
+        if line_height and size:
+            ratio = line_height / size
+            if abs(ratio - 1.0) < 0.1:
+                classes.append("leading-none")
+            elif abs(ratio - 1.25) < 0.1:
+                classes.append("leading-tight")
+            elif abs(ratio - 1.5) < 0.1:
+                classes.append("leading-normal")
+            elif abs(ratio - 1.75) < 0.1:
+                classes.append("leading-relaxed")
+            elif abs(ratio - 2.0) < 0.1:
+                classes.append("leading-loose")
+
+        # Letter spacing
+        letter_spacing = style.get("letterSpacing")
+        if letter_spacing and letter_spacing != 0:
+            ls = round(letter_spacing, 2)
+            if ls > 0:
+                classes.append(f"tracking-[{ls}px]")
+
         # Text color
         if node.fills and len(node.fills) > 0:
             fill = node.fills[0]
@@ -290,7 +313,7 @@ class TailwindConverter:
                 text_class = TailwindConverter._color_to_tailwind(color, "text")
                 if text_class:
                     classes.append(text_class)
-        
+
         return classes
     
     @staticmethod
@@ -321,66 +344,46 @@ class TailwindConverter:
     
     @staticmethod
     def _size_to_tailwind(size: float, prefix: str) -> str:
-        """Convert pixel size to Tailwind spacing"""
-        # Tailwind uses 0.25rem = 4px increments
-        rem = size / 16
-        
-        # Map to closest Tailwind size
-        sizes = {
-            0: "0", 0.125: "0.5", 0.25: "1", 0.5: "2", 
-            0.75: "3", 1: "4", 1.25: "5", 1.5: "6",
-            1.75: "7", 2: "8", 2.5: "10", 3: "12",
-            3.5: "14", 4: "16", 5: "20", 6: "24",
-            8: "32", 10: "40", 12: "48", 14: "56", 16: "64"
+        """Convert pixel size to exact Tailwind spacing using arbitrary values"""
+        size = int(round(size))
+        if size == 0:
+            return f"{prefix}-0"
+
+        # Use standard Tailwind values for common sizes (multiples of 4px)
+        standard_px = {
+            1: "px", 2: "0.5", 4: "1", 6: "1.5", 8: "2", 10: "2.5",
+            12: "3", 14: "3.5", 16: "4", 20: "5", 24: "6", 28: "7",
+            32: "8", 36: "9", 40: "10", 44: "11", 48: "12",
+            56: "14", 64: "16", 80: "20", 96: "24"
         }
-        
-        closest = min(sizes.keys(), key=lambda x: abs(x - rem))
-        return f"{prefix}-{sizes[closest]}"
-    
+
+        if size in standard_px:
+            return f"{prefix}-{standard_px[size]}"
+
+        # For non-standard sizes, use exact pixel value
+        return f"{prefix}-[{size}px]"
+
     @staticmethod
     def _color_to_tailwind(color: Dict, prefix: str) -> Optional[str]:
-        """Convert RGB color to closest Tailwind color"""
+        """Convert RGB color to exact hex Tailwind class"""
         r = int(color.get("r", 0) * 255)
         g = int(color.get("g", 0) * 255)
         b = int(color.get("b", 0) * 255)
-        
-        # Common colors
-        if r > 240 and g > 240 and b > 240:
+
+        # Pure white/black - use standard names
+        if r >= 255 and g >= 255 and b >= 255:
             return f"{prefix}-white"
-        if r < 20 and g < 20 and b < 20:
+        if r == 0 and g == 0 and b == 0:
             return f"{prefix}-black"
-        
-        # Gray scale
-        if abs(r - g) < 20 and abs(g - b) < 20:
-            if r < 64:
-                return f"{prefix}-gray-900"
-            elif r < 128:
-                return f"{prefix}-gray-700"
-            elif r < 192:
-                return f"{prefix}-gray-500"
-            else:
-                return f"{prefix}-gray-300"
-        
-        # Blue
-        if b > r and b > g:
-            if b > 200:
-                return f"{prefix}-blue-600"
-            return f"{prefix}-blue-800"
-        
-        # Red
-        if r > g and r > b:
-            if r > 200:
-                return f"{prefix}-red-600"
-            return f"{prefix}-red-800"
-        
-        # Green
-        if g > r and g > b:
-            if g > 200:
-                return f"{prefix}-green-600"
-            return f"{prefix}-green-800"
-        
-        # Use arbitrary color
-        return f"{prefix}-[rgb({r},{g},{b})]"
+
+        # Transparent check
+        a = color.get("a", 1)
+        if a == 0:
+            return f"{prefix}-transparent"
+
+        # Use exact hex color for everything else
+        hex_color = f"#{r:02x}{g:02x}{b:02x}"
+        return f"{prefix}-[{hex_color}]"
 
 
 class ResponsiveLayoutEngine:
@@ -602,17 +605,262 @@ export default function {component_name}() {{
         return nodes
 
 
+class AICodeGenerator:
+    """AI-powered code generation using Groq vision model for pixel-perfect output"""
+
+    def __init__(self):
+        self.groq_client = None
+        self.model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        try:
+            from groq import Groq
+            api_key = os.getenv("GROQ_API_KEY")
+            if api_key:
+                self.groq_client = Groq(api_key=api_key)
+                logger.info("AI Code Generator: Groq vision enabled")
+        except ImportError:
+            logger.warning("AI Code Generator: groq package not installed")
+
+    @property
+    def available(self):
+        return self.groq_client is not None
+
+    def generate_component(
+        self,
+        node: FigmaNode,
+        component_name: str,
+        image_map: Dict[str, str],
+        figma_screenshot_path: str = None
+    ) -> Optional[str]:
+        """Generate component code using AI vision model"""
+        if not self.groq_client:
+            return None
+
+        try:
+            # Build simplified structure for the prompt
+            structure = self._simplify_node(node, image_map, depth=0)
+            image_refs = [f"  /images/{path.split('/')[-1]}" for _, path in image_map.items()]
+
+            prompt = self._build_prompt(component_name, structure, image_refs)
+
+            messages = []
+
+            # If screenshot available, use vision
+            if figma_screenshot_path and Path(figma_screenshot_path).exists():
+                import base64
+                with open(figma_screenshot_path, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode()
+
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                })
+            else:
+                messages.append({"role": "user", "content": prompt})
+
+            logger.info(f"AI generating component: {component_name}")
+            response = self.groq_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=8000
+            )
+
+            code = response.choices[0].message.content
+
+            # Extract code from markdown code blocks
+            if "```" in code:
+                match = re.search(r'```(?:tsx|jsx|typescript|javascript)?\n(.*?)```', code, re.DOTALL)
+                if match:
+                    code = match.group(1).strip()
+
+            # Validate it has export default
+            if "export default" not in code:
+                code = f'{code}\n\nexport default function {component_name}() {{ return <div>Error</div> }}'
+
+            logger.info(f"AI generated {len(code)} chars for {component_name}")
+            return code
+
+        except Exception as e:
+            logger.error(f"AI code generation failed: {e}")
+            return None
+
+    def _simplify_node(self, node: FigmaNode, image_map: Dict, depth: int = 0) -> Dict:
+        """Create simplified node structure with full CSS properties for AI prompt"""
+        result = {
+            "name": node.name,
+            "type": node.type,
+            "w": int(node.width),
+            "h": int(node.height),
+        }
+
+        # Auto-layout / Flexbox properties
+        if node.has_auto_layout:
+            result["layout"] = node.layout_mode.lower()  # "horizontal" or "vertical"
+            if node.item_spacing > 0:
+                result["gap"] = int(node.item_spacing)
+            # Alignment (maps to justify-content / align-items)
+            result["justify"] = node.primary_axis_align.lower()    # min/center/max/space_between
+            result["align"] = node.counter_axis_align.lower()      # min/center/max/baseline
+            # Sizing mode
+            if node.primary_axis_sizing == "FILL":
+                result["widthMode"] = "fill"
+            if node.counter_axis_sizing == "FILL":
+                result["heightMode"] = "fill"
+
+        # Padding
+        p = node.padding
+        has_padding = any(v > 0 for v in p.values())
+        if has_padding:
+            if p["top"] == p["right"] == p["bottom"] == p["left"]:
+                result["padding"] = int(p["top"])
+            else:
+                result["padding"] = f"{int(p['top'])} {int(p['right'])} {int(p['bottom'])} {int(p['left'])}"
+
+        # Background color
+        if node.fills:
+            for fill in node.fills:
+                if fill.get("type") == "SOLID" and fill.get("visible", True):
+                    c = fill["color"]
+                    r, g, b = int(c["r"]*255), int(c["g"]*255), int(c["b"]*255)
+                    a = fill.get("opacity", c.get("a", 1))
+                    if a < 1:
+                        result["bg"] = f"rgba({r},{g},{b},{round(a,2)})"
+                    else:
+                        result["bg"] = f"#{r:02x}{g:02x}{b:02x}"
+                elif fill.get("type") == "GRADIENT_LINEAR":
+                    result["bg"] = "linear-gradient"
+
+        # Border / Stroke
+        if node.strokes:
+            for stroke in node.strokes:
+                if stroke.get("type") == "SOLID" and stroke.get("visible", True):
+                    c = stroke["color"]
+                    r, g, b = int(c["r"]*255), int(c["g"]*255), int(c["b"]*255)
+                    weight = node.raw.get("strokeWeight", 1)
+                    result["border"] = f"{weight}px #{r:02x}{g:02x}{b:02x}"
+
+        # Corner radius
+        if node.corner_radius > 0:
+            result["radius"] = int(node.corner_radius)
+
+        # Opacity
+        if node.opacity < 1:
+            result["opacity"] = round(node.opacity, 2)
+
+        # Effects (shadows)
+        for effect in node.effects:
+            if effect.get("type") == "DROP_SHADOW" and effect.get("visible", True):
+                offset = effect.get("offset", {})
+                result["shadow"] = {
+                    "x": offset.get("x", 0),
+                    "y": offset.get("y", 0),
+                    "blur": effect.get("radius", 0),
+                    "spread": effect.get("spread", 0)
+                }
+                break
+
+        # Text properties (full CSS)
+        if node.type == "TEXT" and node.characters:
+            result["text"] = node.characters[:150]
+            style = node.style
+            result["css"] = {}
+            if style.get("fontSize"):
+                result["css"]["fontSize"] = f"{int(style['fontSize'])}px"
+            if style.get("fontWeight"):
+                result["css"]["fontWeight"] = style["fontWeight"]
+            if style.get("fontFamily"):
+                result["css"]["fontFamily"] = style["fontFamily"]
+            if style.get("lineHeightPx"):
+                result["css"]["lineHeight"] = f"{round(style['lineHeightPx'], 1)}px"
+            if style.get("letterSpacing"):
+                result["css"]["letterSpacing"] = f"{round(style['letterSpacing'], 1)}px"
+            if style.get("textAlignHorizontal"):
+                result["css"]["textAlign"] = style["textAlignHorizontal"].lower()
+            # Text color
+            if node.fills:
+                for fill in node.fills:
+                    if fill.get("type") == "SOLID":
+                        c = fill["color"]
+                        r, g, b = int(c["r"]*255), int(c["g"]*255), int(c["b"]*255)
+                        result["css"]["color"] = f"#{r:02x}{g:02x}{b:02x}"
+
+        # Image reference
+        if node.id in image_map:
+            result["image"] = image_map[node.id]
+
+        # Children (limit depth to 5 levels for better detail)
+        if depth < 5 and node.children:
+            result["children"] = [
+                self._simplify_node(child, image_map, depth + 1)
+                for child in node.children
+                if child.visible
+            ]
+
+        return result
+
+    def _build_prompt(self, component_name: str, structure: Dict, image_refs: List[str]) -> str:
+        """Build the prompt for AI code generation"""
+        images_list = "\n".join(image_refs) if image_refs else "  (none)"
+
+        # Truncate structure to avoid token limits
+        structure_str = json.dumps(structure, indent=1)
+        if len(structure_str) > 4000:
+            structure_str = structure_str[:4000] + "\n... (truncated)"
+
+        return f"""Generate a React + Tailwind CSS component that EXACTLY matches the design shown in the image.
+
+Component name: {component_name}
+
+Available images (use Next.js Image component with these exact paths):
+{images_list}
+
+The structure data below contains the EXACT CSS properties from Figma for each element:
+- "bg": exact background color (use as bg-[#hex])
+- "css.color": exact text color (use as text-[#hex])
+- "css.fontSize": exact font size (use as text-[Xpx])
+- "css.fontWeight": exact weight (use font-normal/medium/semibold/bold)
+- "layout": flex direction ("horizontal" = flex-row, "vertical" = flex-col)
+- "justify"/"align": flex alignment
+- "gap": spacing between items (use gap-[Xpx])
+- "padding": padding values (use p-[Xpx] or pt/pr/pb/pl)
+- "radius": border radius (use rounded-[Xpx])
+- "border": border width and color
+- "shadow": box shadow
+- "w"/"h": width/height in pixels
+- "widthMode"/"heightMode": "fill" means use w-full/h-full
+
+Figma structure:
+{structure_str}
+
+REQUIREMENTS:
+1. `import Image from 'next/image'` for images, `export default function {component_name}()`
+2. Use EXACT hex colors from the structure data: bg-[#1a1a2e], text-[#667eea], etc.
+3. Use EXACT pixel values for spacing/sizing: w-[240px], gap-[16px], p-[24px], text-[14px]
+4. Match the layout precisely from the image - sidebar, grid, cards, spacing
+5. Include ALL text content from the "text" fields in the structure
+6. For image elements, use: <Image src="..." alt="..." width={{W}} height={{H}} className="object-cover" />
+7. Static component only - no useState/useEffect
+8. Output ONLY the TSX code, no explanations or markdown"""
+
+
 class ProductionFigmaToCode:
     """Production-grade Figma to code converter"""
-    
+
     def __init__(self, figma_token: str):
         self.figma_token = figma_token
         self.api_base = "https://api.figma.com/v1"
         self.component_extractor = ComponentExtractor()
         self.code_generator = ReactCodeGenerator()
+        self.ai_generator = AICodeGenerator()
         self.image_downloader = ImageDownloader(figma_token)
     
-    async def convert(self, figma_url: str, output_dir: Path) -> Dict:
+    async def convert(self, figma_url: str, output_dir: Path, figma_screenshot_path: str = None) -> Dict:
         """Convert Figma to production-ready code"""
         try:
             file_id = self._extract_file_id(figma_url)
@@ -637,10 +885,10 @@ class ProductionFigmaToCode:
             if not frames:
                 raise Exception("No frames found in Figma file")
             
-            # Create output structure
+            # Create output structure (Next.js App Router with src/)
             output_dir.mkdir(parents=True, exist_ok=True)
-            components_dir = output_dir / "components"
-            components_dir.mkdir(exist_ok=True)
+            components_dir = output_dir / "src" / "components"
+            components_dir.mkdir(parents=True, exist_ok=True)
             
             # Download images
             all_nodes = []
@@ -649,28 +897,48 @@ class ProductionFigmaToCode:
             image_map = await self.image_downloader.download_images(file_id, all_nodes, output_dir)
             logger.info(f"✅ Downloaded {len(image_map)} images")
             
-            # Generate components
+            # Generate components - try AI first, fall back to programmatic
             generated = []
             for frame in frames:
                 comp_name = self._sanitize_name(frame.name)
                 logger.info(f"🔨 Generating: {comp_name}")
-                
-                code = self.code_generator.generate_component(frame, comp_name, image_map)
-                
+
+                code = None
+
+                # Try AI-powered generation first (much better quality)
+                if self.ai_generator.available:
+                    logger.info(f"🤖 Using AI code generation for {comp_name}")
+                    code = self.ai_generator.generate_component(
+                        frame, comp_name, image_map, figma_screenshot_path
+                    )
+                    if code:
+                        logger.info(f"✅ AI generated {comp_name} successfully")
+                    else:
+                        logger.warning(f"⚠️ AI generation failed, falling back to programmatic")
+
+                # Fall back to programmatic generation
+                if not code:
+                    logger.info(f"⚙️ Using programmatic generation for {comp_name}")
+                    code = self.code_generator.generate_component(frame, comp_name, image_map)
+
                 comp_file = components_dir / f"{comp_name}.tsx"
                 with open(comp_file, "w", encoding="utf-8") as f:
                     f.write(code)
-                
+
                 generated.append({
                     "name": comp_name,
                     "file": str(comp_file),
                     "original": frame.name
                 })
             
-            # Generate supporting files
-            self._generate_app(output_dir, generated)
+            # Generate supporting files (complete Next.js App Router structure)
+            self._generate_nextjs_structure(output_dir, generated)
             self._generate_package_json(output_dir)
             self._generate_tailwind_config(output_dir)
+            self._generate_postcss_config(output_dir)
+            self._generate_next_config(output_dir)
+            self._generate_tsconfig(output_dir)
+            self._generate_gitignore(output_dir)
             self._generate_readme(output_dir, figma_url)
             
             logger.info("🎉 Conversion complete!")
@@ -802,29 +1070,79 @@ class ProductionFigmaToCode:
         words = name.split()
         return ''.join(word.capitalize() for word in words) or "Component"
     
-    def _generate_app(self, output_dir: Path, components: List[Dict]):
-        """Generate App.tsx"""
+    def _generate_nextjs_structure(self, output_dir: Path, components: List[Dict]):
+        """Generate complete Next.js App Router structure"""
+        # Create src/app directory
+        app_dir = output_dir / "src" / "app"
+        app_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate globals.css with Tailwind directives
+        globals_css = '''@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}
+'''
+        with open(app_dir / "globals.css", "w", encoding="utf-8") as f:
+            f.write(globals_css)
+
+        # Generate layout.tsx
+        layout_code = '''import type { Metadata } from 'next'
+import { Inter } from 'next/font/google'
+import './globals.css'
+
+const inter = Inter({ subsets: ['latin'] })
+
+export const metadata: Metadata = {
+  title: 'Generated from Figma - GodComet',
+  description: 'Figma to Code by GodComet',
+}
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html lang="en">
+      <body className={inter.className}>{children}</body>
+    </html>
+  )
+}
+'''
+        with open(app_dir / "layout.tsx", "w", encoding="utf-8") as f:
+            f.write(layout_code)
+
+        # Generate page.tsx that imports all components
         imports = "\n".join([
-            f"import {c['name']} from './components/{c['name']}'"
+            f"import {c['name']} from '@/components/{c['name']}'"
             for c in components
         ])
-        
-        renders = "\n      ".join([f"<{c['name']} />" for c in components])
-        
-        code = f'''import React from 'react'
-{imports}
 
-export default function App() {{
+        renders = "\n        ".join([f"<{c['name']} />" for c in components])
+
+        page_code = f'''{imports}
+
+export default function Home() {{
   return (
-    <div className="min-h-screen bg-gray-50">
-      {renders}
-    </div>
+    <main className="min-h-screen bg-gray-50">
+      <div className="w-full">
+        {renders}
+      </div>
+    </main>
   )
 }}
 '''
-        
-        with open(output_dir / "App.tsx", "w", encoding="utf-8") as f:
-            f.write(code)
+        with open(app_dir / "page.tsx", "w", encoding="utf-8") as f:
+            f.write(page_code)
+
+        # Ensure src/components exists (should already exist from convert())
+        src_components = output_dir / "src" / "components"
+        src_components.mkdir(parents=True, exist_ok=True)
     
     def _generate_package_json(self, output_dir: Path):
         """Generate package.json"""
@@ -855,13 +1173,11 @@ export default function App() {{
             json.dump(pkg, f, indent=2)
     
     def _generate_tailwind_config(self, output_dir: Path):
-        """Generate tailwind.config.js"""
+        """Generate tailwind.config.js with correct content paths"""
         config = '''/** @type {import('tailwindcss').Config} */
 module.exports = {
   content: [
-    './pages/**/*.{js,ts,jsx,tsx,mdx}',
-    './components/**/*.{js,ts,jsx,tsx,mdx}',
-    './app/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/**/*.{js,ts,jsx,tsx,mdx}',
   ],
   theme: {
     extend: {},
@@ -871,6 +1187,72 @@ module.exports = {
 '''
         with open(output_dir / "tailwind.config.js", "w", encoding="utf-8") as f:
             f.write(config)
+
+    def _generate_postcss_config(self, output_dir: Path):
+        """Generate postcss.config.js"""
+        config = '''module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+'''
+        with open(output_dir / "postcss.config.js", "w", encoding="utf-8") as f:
+            f.write(config)
+
+    def _generate_next_config(self, output_dir: Path):
+        """Generate next.config.js"""
+        config = '''/** @type {import('next').NextConfig} */
+const nextConfig = {
+  images: {
+    unoptimized: true,
+  },
+}
+
+module.exports = nextConfig
+'''
+        with open(output_dir / "next.config.js", "w", encoding="utf-8") as f:
+            f.write(config)
+
+    def _generate_tsconfig(self, output_dir: Path):
+        """Generate tsconfig.json"""
+        tsconfig = {
+            "compilerOptions": {
+                "target": "es5",
+                "lib": ["dom", "dom.iterable", "esnext"],
+                "allowJs": True,
+                "skipLibCheck": True,
+                "strict": True,
+                "noEmit": True,
+                "esModuleInterop": True,
+                "module": "esnext",
+                "moduleResolution": "bundler",
+                "resolveJsonModule": True,
+                "isolatedModules": True,
+                "jsx": "preserve",
+                "incremental": True,
+                "plugins": [{"name": "next"}],
+                "paths": {
+                    "@/*": ["./src/*"]
+                }
+            },
+            "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+            "exclude": ["node_modules"]
+        }
+        with open(output_dir / "tsconfig.json", "w", encoding="utf-8") as f:
+            json.dump(tsconfig, f, indent=2)
+
+    def _generate_gitignore(self, output_dir: Path):
+        """Generate .gitignore"""
+        gitignore = '''node_modules/
+.next/
+out/
+.env
+.env.local
+*.tsbuildinfo
+'''
+        with open(output_dir / ".gitignore", "w", encoding="utf-8") as f:
+            f.write(gitignore)
     
     def _generate_readme(self, output_dir: Path, figma_url: str):
         """Generate README"""

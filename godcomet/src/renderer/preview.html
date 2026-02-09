@@ -341,9 +341,11 @@
     if (window.api && window.api.onPreviewData) {
       window.api.onPreviewData((data) => {
         console.log('Preview data received:', data);
-        previewData = data;
-        workflowId = data.workflow_id;
-        renderPreview(data);
+        // Data may be the full WebSocket message or just the preview object
+        const preview = data.preview || data;
+        workflowId = data.workflow_id || preview.workflow_id;
+        previewData = preview;
+        renderPreview(preview);
       });
     }
 

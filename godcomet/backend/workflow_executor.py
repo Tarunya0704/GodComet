@@ -199,6 +199,7 @@ class WorkflowExecutor:
                                 screenshot_path = screenshots_dir / "figma_original.png"
                                 with open(screenshot_path, "wb") as f:
                                     f.write(img_content.content)
+                                # Store file path for auditor, convert to base64 for preview later
                                 workflow.figma_screenshot = str(screenshot_path)
                                 logger.info(f"Figma screenshot saved: {screenshot_path}")
 
@@ -240,10 +241,15 @@ class WorkflowExecutor:
                 message="Converting Figma to React components..."
             )
 
-            # Generate code
+            # Get figma screenshot path for AI generation
+            screenshot_dir = Path(__file__).parent.parent.parent / "mcp-automation" / "screenshots" / workflow.id
+            figma_screenshot = str(screenshot_dir / "figma_original.png") if screenshot_dir.exists() else None
+
+            # Generate code (AI-powered with Figma screenshot for better accuracy)
             result = await converter.convert(
                 figma_url=workflow.figma_url,
-                output_dir=output_dir
+                output_dir=output_dir,
+                figma_screenshot_path=figma_screenshot
             )
 
             workflow.project_path = str(output_dir)

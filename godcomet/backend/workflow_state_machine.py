@@ -145,13 +145,13 @@ class WorkflowStateMachine:
     # Define valid state transitions
     VALID_TRANSITIONS = {
         WorkflowState.IDLE: [WorkflowState.GENERATING],
-        WorkflowState.GENERATING: [WorkflowState.RENDERING, WorkflowState.ERROR],
-        WorkflowState.RENDERING: [WorkflowState.AUDITING, WorkflowState.ERROR],
-        WorkflowState.AUDITING: [WorkflowState.PREVIEWING, WorkflowState.AWAITING_APPROVAL, WorkflowState.ERROR],
+        WorkflowState.GENERATING: [WorkflowState.GENERATING, WorkflowState.RENDERING, WorkflowState.ERROR],
+        WorkflowState.RENDERING: [WorkflowState.RENDERING, WorkflowState.AUDITING, WorkflowState.ERROR],
+        WorkflowState.AUDITING: [WorkflowState.AUDITING, WorkflowState.PREVIEWING, WorkflowState.AWAITING_APPROVAL, WorkflowState.ERROR],
         WorkflowState.PREVIEWING: [WorkflowState.AWAITING_APPROVAL],
         WorkflowState.AWAITING_APPROVAL: [WorkflowState.DEPLOYING, WorkflowState.REGENERATING, WorkflowState.CANCELLED],
         WorkflowState.REGENERATING: [WorkflowState.RENDERING, WorkflowState.ERROR],
-        WorkflowState.DEPLOYING: [WorkflowState.DONE, WorkflowState.ERROR],
+        WorkflowState.DEPLOYING: [WorkflowState.DEPLOYING, WorkflowState.DONE, WorkflowState.ERROR],
         WorkflowState.DONE: [],
         WorkflowState.ERROR: [WorkflowState.IDLE],  # Allow retry
         WorkflowState.CANCELLED: [WorkflowState.IDLE]
@@ -240,7 +240,8 @@ class WorkflowStateMachine:
         Returns:
             True if transition was successful
         """
-        if not self.can_transition(workflow, new_state):
+        # Allow same-state transitions (progress updates within a step)
+        if workflow.state != new_state and not self.can_transition(workflow, new_state):
             logger.warning(
                 f"Invalid transition: {workflow.state.value} -> {new_state.value} "
                 f"for workflow {workflow.id}"
@@ -334,13 +335,28 @@ class WorkflowStateMachine:
 
         workflow.approval_status = "pending"
 
-        # Create approval request
+        # Create approval request - convert file paths to base64 for WebSocket transport
         from websocket_server import ApprovalRequest
+
+        def _to_base64(filepath):
+            """Convert file path to base64 data URI for preview display"""
+            if not filepath:
+                return ""
+            if filepath.startswith("data:"):
+                return filepath  # Already base64
+            from pathlib import Path as P
+            p = P(filepath)
+            if p.exists():
+                import base64 as b64
+                with open(p, "rb") as f:
+                    return f"data:image/png;base64,{b64.b64encode(f.read()).decode()}"
+            return ""
+
         approval_request = ApprovalRequest(
             workflow_id=workflow.id,
-            figma_screenshot=workflow.figma_screenshot or "",
-            rendered_screenshot=workflow.rendered_screenshot or "",
-            diff_image=workflow.diff_image,
+            figma_screenshot=_to_base64(workflow.figma_screenshot),
+            rendered_screenshot=_to_base64(workflow.rendered_screenshot),
+            diff_image=_to_base64(workflow.diff_image) if workflow.diff_image else None,
             audit_result=workflow.audit_result or {},
             project_path=workflow.project_path or ""
         )
