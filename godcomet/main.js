@@ -615,6 +615,9 @@ function connectToWorkflowServer() {
         if (message.type === 'approval_required') {
           mainWindow.webContents.send('approval-required', message);
         }
+        if (message.type === 'awaiting_code_approval') {
+          mainWindow.webContents.send('approval-required', message);
+        }
         if (message.type === 'complete') {
           mainWindow.webContents.send('workflow-complete', message);
         }
@@ -628,9 +631,26 @@ function connectToWorkflowServer() {
         console.log(`📊 Workflow ${message.workflow_id}: ${message.data?.step} (${message.data?.progress}%)`);
       }
 
+      // Legacy single-gate approval
       if (message.type === 'approval_required') {
         console.log(`🔔 Approval required for workflow: ${message.workflow_id}`);
         createPreviewWindow(message);
+      }
+
+      // Gate 1: code review approval
+      if (message.type === 'awaiting_code_approval') {
+        console.log(`🔔 Code approval required for workflow: ${message.workflow_id}`);
+        createPreviewWindow(message);
+      }
+
+      // Gate 2: deploy approval — update existing window or open new one
+      if (message.type === 'awaiting_deploy_approval') {
+        console.log(`🚀 Deploy approval required for workflow: ${message.workflow_id}`);
+        if (previewWindow && !previewWindow.isDestroyed()) {
+          previewWindow.webContents.send('deploy-approval-required', message);
+        } else {
+          createPreviewWindow(message);
+        }
       }
 
       if (message.type === 'complete') {
@@ -902,14 +922,23 @@ app.whenReady().then(() => {
           error: 'Backend server not running. Start: cd backend && python brain.py'
         };
       }
-      
+
       if (error.code === 'ECONNABORTED') {
         return {
           success: false,
           error: 'Command timed out. Try a simpler command or check backend logs.'
         };
       }
-      
+
+      // ECONNRESET / "stream has been aborted" — server closed connection mid-response
+      // Usually means the backend is busy processing a workflow (Figma rate-limit wait, npm install, etc.)
+      if (error.code === 'ECONNRESET' || (error.message && error.message.includes('aborted'))) {
+        return {
+          success: false,
+          error: 'Backend connection was reset — server is busy (Figma/AI processing). Wait a moment then try again.'
+        };
+      }
+
       return {
         success: false,
         error: error.message
@@ -1144,6 +1173,75 @@ app.whenReady().then(() => {
     if (previewWindow) {
       previewWindow.close();
       previewWindow = null;
+    }
+    return { success: true };
+  });
+
+  // ============================================================================
+  // GATE 1: Code approval IPC handlers
+  // ============================================================================
+
+  ipcMain.handle('code-approve-workflow', (event, workflowId) => {
+    console.log(`Code approved for workflow: ${workflowId}`);
+    if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+      workflowWS.send(JSON.stringify({
+        type: 'code_approval_response',
+        workflow_id: workflowId,
+        approved: true
+      }));
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle('code-reject-workflow', (event, workflowId) => {
+    console.log(`Code rejected for workflow: ${workflowId}`);
+    if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+      workflowWS.send(JSON.stringify({
+        type: 'code_approval_response',
+        workflow_id: workflowId,
+        approved: false
+      }));
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle('code-change-request', (event, workflowId, instruction) => {
+    console.log(`Change requested for workflow: ${workflowId} — "${instruction}"`);
+    if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+      workflowWS.send(JSON.stringify({
+        type: 'code_approval_response',
+        workflow_id: workflowId,
+        change_requested: true,
+        instruction: instruction
+      }));
+    }
+    return { success: true };
+  });
+
+  // ============================================================================
+  // GATE 2: Deploy approval IPC handlers
+  // ============================================================================
+
+  ipcMain.handle('deploy-approve-workflow', (event, workflowId) => {
+    console.log(`Deploy approved for workflow: ${workflowId}`);
+    if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+      workflowWS.send(JSON.stringify({
+        type: 'deploy_approval_response',
+        workflow_id: workflowId,
+        approved: true
+      }));
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle('deploy-reject-workflow', (event, workflowId) => {
+    console.log(`Deploy skipped for workflow: ${workflowId}`);
+    if (workflowWS && workflowWS.readyState === WebSocket.OPEN) {
+      workflowWS.send(JSON.stringify({
+        type: 'deploy_approval_response',
+        workflow_id: workflowId,
+        approved: false
+      }));
     }
     return { success: true };
   });

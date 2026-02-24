@@ -116,6 +116,41 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('preview-data', (event, data) => {
       callback(data);
     });
+  },
+
+  // ============================================================================
+  // GATE 1: Code approval (review generated code before GitHub push)
+  // ============================================================================
+
+  codeApproveWorkflow: (workflowId) => {
+    return ipcRenderer.invoke('code-approve-workflow', workflowId);
+  },
+
+  codeRejectWorkflow: (workflowId) => {
+    return ipcRenderer.invoke('code-reject-workflow', workflowId);
+  },
+
+  codeChangeRequest: (workflowId, instruction) => {
+    return ipcRenderer.invoke('code-change-request', workflowId, instruction);
+  },
+
+  // ============================================================================
+  // GATE 2: Deploy approval (approve Vercel deploy after GitHub push)
+  // ============================================================================
+
+  deployApproveWorkflow: (workflowId) => {
+    return ipcRenderer.invoke('deploy-approve-workflow', workflowId);
+  },
+
+  deployRejectWorkflow: (workflowId) => {
+    return ipcRenderer.invoke('deploy-reject-workflow', workflowId);
+  },
+
+  // Listen for Gate 2 deploy approval (when preview window is already open)
+  onDeployApprovalRequired: (callback) => {
+    ipcRenderer.on('deploy-approval-required', (event, data) => {
+      callback(data);
+    });
   }
 });
 

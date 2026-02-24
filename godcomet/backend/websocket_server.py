@@ -6,7 +6,7 @@ Real-time workflow progress updates and approval workflow
 import asyncio
 import json
 import logging
-from typing import Dict, Set, Optional, Callable, Awaitable
+from typing import Dict, List, Set, Optional, Callable, Awaitable
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
@@ -44,6 +44,30 @@ class ApprovalRequest:
     diff_image: Optional[str]
     audit_result: Dict
     project_path: str
+    figma_url: str = ""  # Original Figma URL so preview can link to design
+
+
+@dataclass
+class CodeApprovalRequest:
+    """Gate 1 — sent before GitHub push so the user can review generated code."""
+    workflow_id: str
+    figma_screenshot: str       # base64 data URI
+    rendered_screenshot: str    # base64 data URI
+    audit_score: Optional[float]
+    audit_result: Dict
+    project_path: str
+    generated_files: List[str]  # relative paths of generated .tsx files
+    figma_url: str = ""
+
+
+@dataclass
+class DeployApprovalRequest:
+    """Gate 2 — sent after GitHub push so the user can approve/skip Vercel deploy."""
+    workflow_id: str
+    github_url: str
+    repo_name: str
+    project_path: str
+    audit_score: Optional[float]
 
 
 @dataclass
@@ -71,7 +95,9 @@ class WorkflowWebSocketServer:
 
     def __init__(self):
         self.clients: Set = set()
-        self.pending_approvals: Dict[str, asyncio.Future] = {}
+        self.pending_approvals: Dict[str, asyncio.Future] = {}         # legacy gate
+        self.pending_code_approvals: Dict[str, asyncio.Future] = {}    # Gate 1
+        self.pending_deploy_approvals: Dict[str, asyncio.Future] = {}  # Gate 2
         self.server = None
         self.port = 8002
 
@@ -135,6 +161,10 @@ class WorkflowWebSocketServer:
 
             if msg_type == "approval_response":
                 await self._handle_approval_response(data)
+            elif msg_type == "code_approval_response":
+                await self._handle_code_approval_response(data)
+            elif msg_type == "deploy_approval_response":
+                await self._handle_deploy_approval_response(data)
             elif msg_type == "cancel":
                 await self._handle_cancel(data)
             elif msg_type == "ping":
@@ -164,17 +194,55 @@ class WorkflowWebSocketServer:
             logger.warning(f"No pending approval for workflow: {workflow_id}")
 
     async def _handle_cancel(self, data: Dict):
-        """Handle workflow cancellation"""
+        """Handle workflow cancellation — resolves whichever gate is currently waiting"""
         workflow_id = data.get("workflow_id")
+        cancelled_payload = {"approved": False, "cancelled": True}
 
-        if workflow_id in self.pending_approvals:
-            future = self.pending_approvals[workflow_id]
+        for pending in (
+            self.pending_approvals,
+            self.pending_code_approvals,
+            self.pending_deploy_approvals,
+        ):
+            if workflow_id in pending:
+                future = pending[workflow_id]
+                if not future.done():
+                    future.set_result(cancelled_payload)
+
+        logger.info(f"Workflow cancelled: {workflow_id}")
+
+    async def _handle_code_approval_response(self, data: Dict):
+        """Handle Gate 1 response: approved / change_requested / rejected"""
+        workflow_id = data.get("workflow_id")
+        if workflow_id in self.pending_code_approvals:
+            future = self.pending_code_approvals[workflow_id]
             if not future.done():
+                approved = data.get("approved", False)
+                change_requested = data.get("change_requested", False)
                 future.set_result({
-                    "approved": False,
-                    "cancelled": True
+                    "approved": approved,
+                    "change_requested": change_requested,
+                    "instruction": data.get("instruction", "") if change_requested else "",
                 })
-            logger.info(f"Workflow cancelled: {workflow_id}")
+            logger.info(
+                f"Code approval response for {workflow_id}: "
+                f"{'approved' if data.get('approved') else 'change' if data.get('change_requested') else 'rejected'}"
+            )
+        else:
+            logger.warning(f"No pending code approval for workflow: {workflow_id}")
+
+    async def _handle_deploy_approval_response(self, data: Dict):
+        """Handle Gate 2 response: approved / rejected"""
+        workflow_id = data.get("workflow_id")
+        if workflow_id in self.pending_deploy_approvals:
+            future = self.pending_deploy_approvals[workflow_id]
+            if not future.done():
+                future.set_result({"approved": data.get("approved", False)})
+            logger.info(
+                f"Deploy approval response for {workflow_id}: "
+                f"{'approved' if data.get('approved') else 'rejected'}"
+            )
+        else:
+            logger.warning(f"No pending deploy approval for workflow: {workflow_id}")
 
     async def broadcast(self, message: Dict):
         """Broadcast message to all connected clients"""
@@ -250,6 +318,76 @@ class WorkflowWebSocketServer:
         finally:
             # Clean up
             self.pending_approvals.pop(workflow_id, None)
+
+    async def request_code_approval(
+        self,
+        request: "CodeApprovalRequest",
+        timeout: float = 300.0
+    ) -> Dict:
+        """
+        Gate 1: broadcast awaiting_code_approval and wait for the UI response.
+
+        Expected response message from UI:
+          {"type": "code_approval_response", "workflow_id": "...",
+           "approved": true}
+          {"type": "code_approval_response", "workflow_id": "...",
+           "change_requested": true, "instruction": "make the button blue"}
+          {"type": "code_approval_response", "workflow_id": "...",
+           "approved": false}
+        """
+        workflow_id = request.workflow_id
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.pending_code_approvals[workflow_id] = future
+
+        try:
+            await self.broadcast({
+                "type": "awaiting_code_approval",
+                "workflow_id": workflow_id,
+                "preview": asdict(request)
+            })
+            logger.info(f"Code approval requested for workflow: {workflow_id}")
+
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Code approval timeout for workflow: {workflow_id}")
+                return {"approved": False, "timeout": True}
+        finally:
+            self.pending_code_approvals.pop(workflow_id, None)
+
+    async def request_deploy_approval(
+        self,
+        request: "DeployApprovalRequest",
+        timeout: float = 300.0
+    ) -> Dict:
+        """
+        Gate 2: broadcast awaiting_deploy_approval and wait for the UI response.
+
+        Expected response message from UI:
+          {"type": "deploy_approval_response", "workflow_id": "...", "approved": true}
+          {"type": "deploy_approval_response", "workflow_id": "...", "approved": false}
+        """
+        workflow_id = request.workflow_id
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.pending_deploy_approvals[workflow_id] = future
+
+        try:
+            await self.broadcast({
+                "type": "awaiting_deploy_approval",
+                "workflow_id": workflow_id,
+                "preview": asdict(request)
+            })
+            logger.info(f"Deploy approval requested for workflow: {workflow_id}")
+
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Deploy approval timeout for workflow: {workflow_id}")
+                return {"approved": False, "timeout": True}
+        finally:
+            self.pending_deploy_approvals.pop(workflow_id, None)
 
     async def send_complete(self, completion: WorkflowComplete):
         """Send workflow completion notification"""

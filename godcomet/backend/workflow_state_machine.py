@@ -24,9 +24,16 @@ class WorkflowState(Enum):
     RENDERING = "rendering"
     AUDITING = "auditing"
     PREVIEWING = "previewing"
+    # Legacy single gate — kept so any existing callers don't break
     AWAITING_APPROVAL = "awaiting_approval"
+    # Gate 1: user reviews generated code before GitHub push
+    AWAITING_CODE_APPROVAL = "awaiting_code_approval"
+    # User requested edits at Gate 1 — re-runs codegen then returns to Gate 1
+    CHANGE_REQUESTED = "change_requested"
     REGENERATING = "regenerating"
     DEPLOYING = "deploying"
+    # Gate 2: user approves Vercel deploy after GitHub push
+    AWAITING_DEPLOY_APPROVAL = "awaiting_deploy_approval"
     DONE = "done"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -76,8 +83,18 @@ class WorkflowContext:
     audit_result: Optional[Dict] = None
     audit_score: Optional[float] = None
 
-    # Approval
+    # Legacy single-gate approval
     approval_status: str = "pending"  # pending, approved, rejected
+
+    # Gate 1 — code review before GitHub push
+    code_approval_status: str = "pending"   # pending, approved, rejected, change_requested
+    # Gate 2 — deploy approval before Vercel
+    deploy_approval_status: str = "pending"  # pending, approved, rejected
+    # Change instruction from user at Gate 1 ("make the button blue")
+    change_request: Optional[str] = None
+
+    # Component registry
+    registry_path: Optional[str] = None
 
     # Deployment
     github_url: Optional[str] = None
@@ -122,7 +139,11 @@ class WorkflowContext:
             "audit_score": self.audit_score,
             "audit_result": self.audit_result,
             "approval_status": self.approval_status,
+            "code_approval_status": self.code_approval_status,
+            "deploy_approval_status": self.deploy_approval_status,
+            "change_request": self.change_request,
             "project_path": self.project_path,
+            "registry_path": self.registry_path,
             "github_url": self.github_url,
             "vercel_url": self.vercel_url,
             "error": self.error,
@@ -135,11 +156,23 @@ class WorkflowStateMachine:
     Manages workflow state transitions and coordinates with WebSocket server
 
     State Flow:
-    idle -> generating -> rendering -> auditing -> previewing
-         -> awaiting_approval -> deploying -> done
-                    |
-                    v (if rejected)
-              regenerating -> rendering -> ...
+    idle → generating → rendering → auditing
+         → awaiting_code_approval  ← ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+               │ approve                                      │ (loop back after change)
+               │ change ──→ change_requested → generating ───┘
+               │ reject ──→ error
+               ↓
+           deploying  (GitHub push)
+               ↓
+         awaiting_deploy_approval
+               │ approve
+               │ reject ──→ done  (kept on GitHub, not deployed)
+               ↓
+           deploying  (Vercel deploy)
+               ↓
+             done
+
+    Legacy path (backward compat): auditing → awaiting_approval → deploying → done
     """
 
     # Define valid state transitions
@@ -147,14 +180,50 @@ class WorkflowStateMachine:
         WorkflowState.IDLE: [WorkflowState.GENERATING],
         WorkflowState.GENERATING: [WorkflowState.GENERATING, WorkflowState.RENDERING, WorkflowState.ERROR],
         WorkflowState.RENDERING: [WorkflowState.RENDERING, WorkflowState.AUDITING, WorkflowState.ERROR],
-        WorkflowState.AUDITING: [WorkflowState.AUDITING, WorkflowState.PREVIEWING, WorkflowState.AWAITING_APPROVAL, WorkflowState.ERROR],
-        WorkflowState.PREVIEWING: [WorkflowState.AWAITING_APPROVAL],
-        WorkflowState.AWAITING_APPROVAL: [WorkflowState.DEPLOYING, WorkflowState.REGENERATING, WorkflowState.CANCELLED],
+        WorkflowState.AUDITING: [
+            WorkflowState.AUDITING,
+            WorkflowState.AWAITING_CODE_APPROVAL,
+            WorkflowState.PREVIEWING,
+            WorkflowState.AWAITING_APPROVAL,   # legacy path
+            WorkflowState.ERROR,
+        ],
+        WorkflowState.PREVIEWING: [
+            WorkflowState.AWAITING_CODE_APPROVAL,
+            WorkflowState.AWAITING_APPROVAL,   # legacy path
+        ],
+        # Legacy single gate (kept for backward compat)
+        WorkflowState.AWAITING_APPROVAL: [
+            WorkflowState.DEPLOYING, WorkflowState.REGENERATING, WorkflowState.CANCELLED,
+        ],
+        # Gate 1: code review before GitHub push
+        WorkflowState.AWAITING_CODE_APPROVAL: [
+            WorkflowState.DEPLOYING,           # approved → push to GitHub
+            WorkflowState.CHANGE_REQUESTED,    # user wants edits
+            WorkflowState.ERROR,               # rejected
+            WorkflowState.CANCELLED,
+        ],
+        WorkflowState.CHANGE_REQUESTED: [
+            WorkflowState.GENERATING,          # re-run codegen
+            WorkflowState.RENDERING,           # or jump straight to re-render
+            WorkflowState.ERROR,
+        ],
         WorkflowState.REGENERATING: [WorkflowState.RENDERING, WorkflowState.ERROR],
-        WorkflowState.DEPLOYING: [WorkflowState.DEPLOYING, WorkflowState.DONE, WorkflowState.ERROR],
+        # GitHub push happens inside DEPLOYING; then optionally pauses at Gate 2
+        WorkflowState.DEPLOYING: [
+            WorkflowState.DEPLOYING,
+            WorkflowState.AWAITING_DEPLOY_APPROVAL,
+            WorkflowState.DONE,
+            WorkflowState.ERROR,
+        ],
+        # Gate 2: deploy approval before Vercel
+        WorkflowState.AWAITING_DEPLOY_APPROVAL: [
+            WorkflowState.DEPLOYING,           # approved → Vercel deploy
+            WorkflowState.DONE,                # rejected → done without Vercel
+            WorkflowState.CANCELLED,
+        ],
         WorkflowState.DONE: [],
-        WorkflowState.ERROR: [WorkflowState.IDLE],  # Allow retry
-        WorkflowState.CANCELLED: [WorkflowState.IDLE]
+        WorkflowState.ERROR: [WorkflowState.IDLE],
+        WorkflowState.CANCELLED: [WorkflowState.IDLE],
     }
 
     # Default workflow steps
@@ -164,9 +233,10 @@ class WorkflowStateMachine:
         "Starting dev server",
         "Rendering website",
         "Visual audit",
-        "Awaiting approval",
+        "Awaiting code approval",    # Gate 1
         "Creating GitHub repo",
-        "Deploying to Vercel"
+        "Awaiting deploy approval",  # Gate 2
+        "Deploying to Vercel",
     ]
 
     def __init__(self, websocket_server=None):
@@ -358,7 +428,8 @@ class WorkflowStateMachine:
             rendered_screenshot=_to_base64(workflow.rendered_screenshot),
             diff_image=_to_base64(workflow.diff_image) if workflow.diff_image else None,
             audit_result=workflow.audit_result or {},
-            project_path=workflow.project_path or ""
+            project_path=workflow.project_path or "",
+            figma_url=workflow.figma_url or ""
         )
 
         # Request approval and wait
@@ -374,6 +445,125 @@ class WorkflowStateMachine:
         else:
             workflow.approval_status = "rejected"
             logger.info(f"Workflow {workflow.id} rejected")
+
+        return response
+
+    async def request_code_approval(
+        self,
+        workflow: WorkflowContext,
+        timeout: float = 300.0
+    ) -> Dict:
+        """
+        Gate 1 — pause before GitHub push.
+        Returns one of:
+          {"approved": True}
+          {"change_requested": True, "instruction": "make the button blue"}
+          {"approved": False}  (rejected or timed out)
+        """
+        if not self.ws_server:
+            logger.warning("No WebSocket server configured, auto-approving code")
+            return {"approved": True, "auto": True}
+
+        await self.transition(
+            workflow,
+            WorkflowState.AWAITING_CODE_APPROVAL,
+            step_name="Awaiting code approval",
+            progress=62,
+            message="Review generated code before pushing to GitHub"
+        )
+        workflow.code_approval_status = "pending"
+
+        from websocket_server import CodeApprovalRequest
+
+        def _to_base64(filepath):
+            if not filepath:
+                return ""
+            if filepath.startswith("data:"):
+                return filepath
+            from pathlib import Path as P
+            p = P(filepath)
+            if p.exists():
+                import base64 as b64
+                with open(p, "rb") as f:
+                    return f"data:image/png;base64,{b64.b64encode(f.read()).decode()}"
+            return ""
+
+        # Collect generated file list for the UI
+        generated_files = []
+        if workflow.project_path:
+            from pathlib import Path as P
+            project = P(workflow.project_path)
+            for tsx in sorted(project.rglob("*.tsx")):
+                generated_files.append(str(tsx.relative_to(project)))
+
+        request = CodeApprovalRequest(
+            workflow_id=workflow.id,
+            figma_screenshot=_to_base64(workflow.figma_screenshot),
+            rendered_screenshot=_to_base64(workflow.rendered_screenshot),
+            audit_score=workflow.audit_score,
+            audit_result=workflow.audit_result or {},
+            project_path=workflow.project_path or "",
+            generated_files=generated_files,
+            figma_url=workflow.figma_url or ""
+        )
+
+        response = await self.ws_server.request_code_approval(request, timeout)
+
+        if response.get("approved"):
+            workflow.code_approval_status = "approved"
+            logger.info(f"Workflow {workflow.id} code approved")
+        elif response.get("change_requested"):
+            workflow.code_approval_status = "change_requested"
+            workflow.change_request = response.get("instruction", "")
+            logger.info(f"Workflow {workflow.id} change requested: {workflow.change_request!r}")
+        else:
+            workflow.code_approval_status = "rejected"
+            logger.info(f"Workflow {workflow.id} code rejected")
+
+        return response
+
+    async def request_deploy_approval(
+        self,
+        workflow: WorkflowContext,
+        timeout: float = 300.0
+    ) -> Dict:
+        """
+        Gate 2 — pause after GitHub push, before Vercel deploy.
+        Returns one of:
+          {"approved": True}
+          {"approved": False}  (skipped deploy — code stays on GitHub)
+        """
+        if not self.ws_server:
+            logger.warning("No WebSocket server configured, auto-approving deploy")
+            return {"approved": True, "auto": True}
+
+        await self.transition(
+            workflow,
+            WorkflowState.AWAITING_DEPLOY_APPROVAL,
+            step_name="Awaiting deploy approval",
+            progress=87,
+            message="Code is on GitHub — approve to deploy to Vercel"
+        )
+        workflow.deploy_approval_status = "pending"
+
+        from websocket_server import DeployApprovalRequest
+
+        request = DeployApprovalRequest(
+            workflow_id=workflow.id,
+            github_url=workflow.github_url or "",
+            repo_name=workflow.project_name,
+            project_path=workflow.project_path or "",
+            audit_score=workflow.audit_score
+        )
+
+        response = await self.ws_server.request_deploy_approval(request, timeout)
+
+        if response.get("approved"):
+            workflow.deploy_approval_status = "approved"
+            logger.info(f"Workflow {workflow.id} deploy approved")
+        else:
+            workflow.deploy_approval_status = "rejected"
+            logger.info(f"Workflow {workflow.id} deploy skipped — code stays on GitHub only")
 
         return response
 
@@ -449,8 +639,11 @@ class WorkflowStateMachine:
             WorkflowState.AUDITING,
             WorkflowState.PREVIEWING,
             WorkflowState.AWAITING_APPROVAL,
+            WorkflowState.AWAITING_CODE_APPROVAL,
+            WorkflowState.AWAITING_DEPLOY_APPROVAL,
+            WorkflowState.CHANGE_REQUESTED,
             WorkflowState.REGENERATING,
-            WorkflowState.DEPLOYING
+            WorkflowState.DEPLOYING,
         ]
         return [
             w.to_dict() for w in self.workflows.values()

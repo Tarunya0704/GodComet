@@ -51,28 +51,32 @@ class RenderEngine:
         full_page: bool = True
     ) -> Dict:
         """
-        Main render function - starts dev server, captures screenshot
+        Main render function.
+
+        Strategy (fastest → slowest):
+          1. Static export: npm run build → open out/index.html with file:// (no server needed)
+          2. Dev server fallback: npm run dev → http://localhost:PORT
 
         Returns:
             {
                 "screenshot_path": "/path/to/screenshot.png",
                 "dom_tree": "<html>...</html>",
-                "url": "http://localhost:3000",
+                "url": "...",
                 "viewport": {"width": 1440, "height": 900},
                 "metadata": {...}
             }
         """
         print(f"🎬 Starting render pipeline for: {project_path}")
 
-        # Use default viewport if not specified
         viewport = {
             "width": viewport_width or self.default_viewport["width"],
             "height": viewport_height or self.default_viewport["height"]
         }
 
-        # Step 1: Start development server
+        # Step 1: Build / start server
         server_url, server_process = await self._start_dev_server(project_path)
-        print(f"   🌐 Dev server running: {server_url}")
+        is_file_url = server_url.startswith("file://")
+        print(f"   🌐 {'Static file' if is_file_url else 'Dev server'}: {server_url[:80]}")
 
         try:
             # Step 2: Launch browser and navigate
@@ -80,24 +84,23 @@ class RenderEngine:
                 browser = await p.chromium.launch(
                     headless=True,
                     args=[
-                        '--disable-web-security',  # For local dev
-                        '--disable-features=IsolateOrigins,site-per-process'
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                        '--allow-file-access-from-files',   # Needed for file:// URLs
                     ]
                 )
 
                 page = await browser.new_page(viewport=viewport)
 
-                # Disable animations if requested
                 if self.disable_animations:
                     await self._disable_animations(page)
 
-                # Navigate to the dev server
-                print(f"   🔗 Navigating to {server_url}...")
-                await page.goto(server_url, wait_until="networkidle", timeout=60000)
+                # file:// pages don't have network requests — use "load" not "networkidle"
+                wait_until = "load" if is_file_url else "networkidle"
+                print(f"   🔗 Navigating ({wait_until})...")
+                await page.goto(server_url, wait_until=wait_until, timeout=60000)
 
-                # Wait for fonts and images
                 await page.wait_for_timeout(self.wait_for_fonts)
-                print(f"   ⏳ Waited {self.wait_for_fonts}ms for assets to load")
 
                 # Step 3: Capture screenshot
                 if not output_path:
@@ -106,22 +109,19 @@ class RenderEngine:
                     timestamp = int(time.time())
                     output_path = str(output_dir / f"render_{timestamp}.png")
 
-                screenshot_bytes = await page.screenshot(
+                await page.screenshot(
                     path=output_path,
                     full_page=full_page,
                     type="png"
                 )
                 print(f"   📸 Screenshot saved: {output_path}")
 
-                # Step 4: Extract DOM tree
                 dom_tree = await page.content()
-
-                # Step 5: Get accessibility tree (useful for semantic analysis)
                 accessibility_tree = await self._get_accessibility_tree(page)
-
                 await browser.close()
 
-                result = {
+                print(f"   ✅ Render complete!")
+                return {
                     "screenshot_path": output_path,
                     "dom_tree": dom_tree,
                     "accessibility_tree": accessibility_tree,
@@ -134,49 +134,68 @@ class RenderEngine:
                     }
                 }
 
-                print(f"   ✅ Render complete!")
-                return result
-
         finally:
-            # Step 6: Cleanup - stop dev server
             await self._stop_dev_server(server_process)
 
-    async def _start_dev_server(self, project_path: str) -> Tuple[str, subprocess.Popen]:
+    async def _start_dev_server(self, project_path: str) -> Tuple[str, Optional[subprocess.Popen]]:
         """
-        Start Next.js/React dev server and wait for it to be ready
+        Build project and return URL to render.
+
+        Strategy:
+          1. Static export: `npm run build` → file://...out/index.html  (fast, no server)
+          2. Dev server fallback: `npm run dev` (slow, last resort)
         """
         project_dir = Path(project_path)
 
-        # Check if package.json exists
         package_json = project_dir / "package.json"
         if not package_json.exists():
             raise FileNotFoundError(f"package.json not found in {project_path}")
 
-        # Detect framework and port
-        port = self._find_available_port(3000)
-
-        # Check if dependencies are installed
+        # Install dependencies if needed
         node_modules = project_dir / "node_modules"
         if not node_modules.exists():
-            print(f"   📦 Installing dependencies...")
-            install_process = subprocess.run(
-                ["npm", "install"],
+            print(f"   📦 Installing dependencies (first time, may take ~2 min)...")
+            install_result = subprocess.run(
+                ["npm", "install", "--prefer-offline", "--no-audit"],
                 cwd=str(project_dir),
                 capture_output=True,
                 text=True,
-                shell=True
+                shell=True,
+                timeout=300
             )
-            if install_process.returncode != 0:
-                print(f"   ⚠️  npm install warnings: {install_process.stderr[:200]}")
+            if install_result.returncode != 0:
+                print(f"   ⚠️  npm install stderr: {install_result.stderr[:300]}")
 
-        # Start dev server (Next.js or Vite)
-        # Try Next.js first
+        # ── Strategy 1: Static export (next build → out/) ──────────────────
+        print(f"   🏗️  Building static export (npm run build)...")
+        build_result = subprocess.run(
+            ["npm", "run", "build"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            shell=True,
+            timeout=300,
+            env={**os.environ, "CI": "false"}   # CI=false suppresses warning-as-error
+        )
+
+        if build_result.returncode == 0:
+            out_dir = project_dir / "out"
+            index_html = out_dir / "index.html"
+            if index_html.exists():
+                # Convert Windows backslash path to forward slashes for file:// URL
+                file_url = "file:///" + index_html.as_posix()
+                print(f"   ✅ Static build succeeded → {file_url}")
+                return file_url, None   # No server process to manage
+        else:
+            print(f"   ⚠️  Static build failed (rc={build_result.returncode}). stderr:")
+            print(f"       {build_result.stderr[:500]}")
+            print(f"   ↩️  Falling back to dev server...")
+
+        # ── Strategy 2: Dev server fallback ────────────────────────────────
+        port = self._find_available_port(3000)
         print(f"   🚀 Starting dev server on port {port}...")
 
-        # Use "npm run dev" which works for both Next.js and Vite
-        env = os.environ.copy()
-        env["PORT"] = str(port)
-
+        env = {**os.environ, "PORT": str(port)}
         server_process = subprocess.Popen(
             ["npm", "run", "dev"],
             cwd=str(project_dir),
@@ -187,33 +206,35 @@ class RenderEngine:
             shell=True
         )
 
-        # Wait for server to be ready (max 30 seconds)
-        server_url = f"http://localhost:{port}"
-        max_wait = 30
+        server_url = f"http://127.0.0.1:{port}"
+        max_wait = 120
         waited = 0
 
         while waited < max_wait:
             try:
-                # Try to connect
                 import requests
-                response = requests.get(server_url, timeout=1)
-                if response.status_code == 200:
-                    print(f"   ✅ Server ready after {waited}s")
+                response = requests.get(server_url, timeout=2)
+                if response.status_code in (200, 404):
+                    print(f"   ✅ Dev server ready after {waited}s")
                     break
-            except:
+            except Exception:
                 pass
 
             await asyncio.sleep(1)
             waited += 1
 
-            # Check if process died
             if server_process.poll() is not None:
                 stderr = server_process.stderr.read()
-                raise RuntimeError(f"Dev server failed to start: {stderr}")
+                raise RuntimeError(f"Dev server process exited unexpectedly: {stderr[:500]}")
 
         if waited >= max_wait:
+            try:
+                stderr_out = server_process.stderr.read(2000) if server_process.stderr else ""
+                print(f"   ❌ Server stderr: {stderr_out}")
+            except Exception:
+                pass
             server_process.kill()
-            raise TimeoutError(f"Dev server did not start within {max_wait}s")
+            raise TimeoutError(f"Dev server did not respond within {max_wait}s on port {port}")
 
         return server_url, server_process
 

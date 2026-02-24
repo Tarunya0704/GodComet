@@ -443,12 +443,28 @@ class VerifiedFigmaConverter:
                 "score": current_score
             })
 
-            # Check if passed
+            # Log full score history so improvement is visible across iterations
+            history_scores = [h["score"] for h in self.iteration_history]
+            history_str = " → ".join(f"{s:.1%}" for s in history_scores)
+            print(f"   📈 Score history: [{history_str}]")
+
+            # Check if passed the deployment threshold
             if passed:
                 print(f"   ✅ PASSED! Score {current_score:.1%} meets threshold {self.threshold:.0%}")
                 return {
                     "final_score": current_score,
                     "passed": True,
+                    "iterations": iteration,
+                    "final_audit": audit_result
+                }
+
+            # Early-stop: score is good enough — avoid burning more API calls on healing
+            HEALING_THRESHOLD = 0.85
+            if current_score >= HEALING_THRESHOLD:
+                print(f"   ✅ Score {current_score:.1%} ≥ healing threshold ({HEALING_THRESHOLD:.0%}), stopping early")
+                return {
+                    "final_score": current_score,
+                    "passed": False,
                     "iterations": iteration,
                     "final_audit": audit_result
                 }
@@ -494,17 +510,25 @@ class VerifiedFigmaConverter:
             print(f"   🤖 Regenerating code with corrections...")
             heal_start = time.time()
 
-            # Re-run code generation with healing prompt
-            # NOTE: This would call the AI with the enhanced prompt
-            # For now, we'll simulate by just copying the project
-            # In production, you'd call Groq/Claude here with the healing_prompt
-
-            # TODO: Implement actual code regeneration with healing prompt
-            # heal_result = await self._regenerate_code_with_healing(
-            #     figma_metadata, healing_prompt, project_path
-            # )
+            healed = await self._regenerate_code_with_healing(
+                project_path=project_path,
+                figma_screenshot_path=figma_screenshot_path,
+                rendered_screenshot_path=rendered_screenshot,
+                audit_result=audit_result,
+                healing_prompt=healing_prompt
+            )
 
             heal_duration = time.time() - heal_start
+
+            if not healed:
+                print(f"   ⚠️  Healing unavailable (Groq key missing or call failed), stopping at iteration {iteration}")
+                return {
+                    "final_score": current_score,
+                    "passed": False,
+                    "iterations": iteration,
+                    "final_audit": audit_result
+                }
+
             print(f"   ✅ Code regenerated in {heal_duration:.1f}s")
 
             previous_score = current_score
@@ -516,6 +540,179 @@ class VerifiedFigmaConverter:
             "iterations": self.max_iterations,
             "final_audit": audit_result
         }
+
+    async def _regenerate_code_with_healing(
+        self,
+        project_path: str,
+        figma_screenshot_path: str,
+        rendered_screenshot_path: str,
+        audit_result: Dict,
+        healing_prompt: str
+    ) -> bool:
+        """
+        Regenerate project TSX files guided by the visual diff between Figma and
+        the current rendered output.
+
+        Sends both screenshots + all current TSX files to Groq vision, asks it to
+        fix ONLY the components that look wrong, then writes the response back to
+        disk so the next render iteration picks up the changes.
+
+        Returns True on success, False if Groq is unavailable or the call fails.
+        """
+        import base64
+        import re as _re
+
+        # --- Groq client (same pattern as AICodeGenerator) ---
+        try:
+            from groq import Groq
+        except ImportError:
+            print("   ⚠️  groq package not installed, cannot self-heal")
+            return False
+
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            print("   ⚠️  GROQ_API_KEY not set, cannot self-heal")
+            return False
+
+        groq_client = Groq(api_key=api_key)
+        model = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+        # --- Collect current TSX files ---
+        project = Path(project_path)
+        tsx_files: Dict[str, str] = {}
+
+        # Root page file
+        for candidate in [
+            project / "src" / "app" / "page.tsx",
+            project / "src" / "pages" / "index.tsx",
+        ]:
+            if candidate.exists():
+                tsx_files[str(candidate.relative_to(project))] = candidate.read_text(encoding="utf-8")
+                break
+
+        # Component files
+        components_dir = project / "src" / "components"
+        if components_dir.exists():
+            for f in sorted(components_dir.glob("*.tsx")):
+                tsx_files[str(f.relative_to(project))] = f.read_text(encoding="utf-8")
+
+        if not tsx_files:
+            print("   ⚠️  No TSX files found in project, cannot self-heal")
+            return False
+
+        # --- Encode both screenshots to base64 (same as visual_auditor._encode_image) ---
+        def _encode(path: str) -> str:
+            with open(path, "rb") as fh:
+                return base64.b64encode(fh.read()).decode()
+
+        figma_b64 = _encode(figma_screenshot_path)
+        rendered_b64 = _encode(rendered_screenshot_path)
+
+        # --- Summarise audit issues (capped to keep within token budget) ---
+        issues = audit_result.get("issues", [])
+        critical = [i for i in issues if i.get("severity") == "critical"]
+        minor = [i for i in issues if i.get("severity") not in ("critical",)]
+
+        issues_text = ""
+        if critical:
+            issues_text += "CRITICAL (must fix):\n"
+            for iss in critical:
+                fix = f" → Fix: {iss['fix']}" if iss.get("fix") else ""
+                issues_text += (
+                    f"  • {iss.get('type','?')} on <{iss.get('element','?')}>: "
+                    f"expected {iss.get('expected','?')}, got {iss.get('actual','?')}{fix}\n"
+                )
+        if minor:
+            issues_text += "MINOR (should fix):\n"
+            for iss in minor[:5]:  # Cap to avoid token bloat
+                issues_text += (
+                    f"  • {iss.get('type','?')} on <{iss.get('element','?')}>: "
+                    f"expected {iss.get('expected','?')}, got {iss.get('actual','?')}\n"
+                )
+
+        # --- Build code block string ---
+        code_context = ""
+        for rel_path, code in tsx_files.items():
+            code_context += f"\n=== {rel_path} ===\n{code}\n"
+
+        system_text = (
+            "You are a React/Next.js UI engineer fixing visual mismatches.\n"
+            "Image 1 = Figma reference (target). Image 2 = current rendered output (needs fixing).\n"
+            "Fix ONLY the components that differ from the Figma reference. "
+            "Leave working sections untouched.\n"
+            "Return ONLY the changed files. Each file MUST start with its relative path marker:\n"
+            "  === src/app/page.tsx ===\n"
+            "Then the full corrected file content — no markdown fences, no explanation.\n"
+            "Omit any file that needs no changes."
+        )
+
+        user_content = [
+            {"type": "text", "text": "Figma Reference (target):"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{figma_b64}"}},
+            {"type": "text", "text": "Current Rendered Output (needs fixing):"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{rendered_b64}"}},
+            {
+                "type": "text",
+                "text": (
+                    f"Visual issues to fix:\n{issues_text}\n"
+                    f"Additional context:\n{healing_prompt}\n\n"
+                    f"Current project code:\n{code_context}\n\n"
+                    "Return the corrected file(s) now."
+                ),
+            },
+        ]
+
+        # --- Groq vision call (same pattern as AICodeGenerator.generate_component) ---
+        try:
+            response = groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.1,
+                max_tokens=8000,
+            )
+        except Exception as e:
+            print(f"   ⚠️  Groq healing call failed: {e}")
+            return False
+
+        raw = response.choices[0].message.content
+
+        # --- Parse "=== path ===" file blocks from response ---
+        parts = _re.split(r'^=== (.+?) ===\s*$', raw, flags=_re.MULTILINE)
+        # parts = ['prefix', 'path1', 'code1', 'path2', 'code2', ...]
+
+        if len(parts) < 3:
+            # No markers — try writing the whole response to the root page as fallback
+            root_rel = list(tsx_files.keys())[0]
+            code = _re.sub(r'^```[^\n]*\n|```$', '', raw.strip(), flags=_re.MULTILINE).strip()
+            if "export default" in code:
+                (project / root_rel).write_text(code, encoding="utf-8")
+                print(f"   💾 (fallback) Healed code written to {root_rel}")
+                return True
+            print("   ⚠️  Groq response had no file markers and no valid TSX — skipping write")
+            return False
+
+        written: List[str] = []
+        for i in range(1, len(parts) - 1, 2):
+            rel_path = parts[i].strip()
+            code = parts[i + 1].strip()
+            # Strip accidental markdown fences
+            code = _re.sub(r'^```[^\n]*\n|```$', '', code, flags=_re.MULTILINE).strip()
+            if not code:
+                continue
+            dest = project / rel_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(code, encoding="utf-8")
+            written.append(rel_path)
+
+        if written:
+            print(f"   💾 Healed files written: {', '.join(written)}")
+            return True
+
+        print("   ⚠️  Groq returned file markers but all code blocks were empty")
+        return False
 
     async def _deploy_to_production(
         self,

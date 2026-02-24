@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 import asyncio
 import aiohttp
 import time  # ⭐ ADDED for caching
+import hashlib
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -175,29 +177,58 @@ class TailwindConverter:
     
     @staticmethod
     def get_sizing_classes(node: FigmaNode) -> List[str]:
-        """Convert width/height to Tailwind"""
+        """Convert width/height to Tailwind — respects auto-layout axis direction.
+
+        In Figma:
+          HORIZONTAL frame: primary axis = width, counter axis = height
+          VERTICAL frame:   primary axis = height, counter axis = width
+          No layout:        use actual absolute bounds directly
+        """
         classes = []
-        
-        # Width
-        if node.primary_axis_sizing == "FIXED":
-            w = int(node.width)
-            if w == 0:
-                pass
-            elif w <= 640:
-                classes.append(f"w-[{w}px]")
-            else:
+
+        if node.layout_mode == "HORIZONTAL":
+            # Primary → width
+            if node.primary_axis_sizing == "FIXED":
+                w = int(node.width)
+                if w > 0:
+                    classes.append(f"w-[{w}px]" if w <= 640 else "w-full")
+            elif node.primary_axis_sizing == "FILL":
                 classes.append("w-full")
-        elif node.primary_axis_sizing == "FILL":
-            classes.append("w-full")
-        
-        # Height
-        if node.counter_axis_sizing == "FIXED":
+
+            # Counter → height
+            if node.counter_axis_sizing == "FIXED":
+                h = int(node.height)
+                if h > 0:
+                    classes.append(f"h-[{h}px]")
+            elif node.counter_axis_sizing == "FILL":
+                classes.append("h-full")
+
+        elif node.layout_mode == "VERTICAL":
+            # Primary → height
+            if node.primary_axis_sizing == "FIXED":
+                h = int(node.height)
+                if h > 0:
+                    classes.append(f"h-[{h}px]")
+            elif node.primary_axis_sizing == "FILL":
+                classes.append("h-full")
+
+            # Counter → width
+            if node.counter_axis_sizing == "FIXED":
+                w = int(node.width)
+                if w > 0:
+                    classes.append(f"w-[{w}px]" if w <= 640 else "w-full")
+            elif node.counter_axis_sizing == "FILL":
+                classes.append("w-full")
+
+        else:
+            # No auto-layout — size from absolute bounding box
+            w = int(node.width)
             h = int(node.height)
+            if w > 0:
+                classes.append(f"w-[{w}px]" if w <= 640 else "w-full")
             if h > 0:
                 classes.append(f"h-[{h}px]")
-        elif node.counter_axis_sizing == "FILL":
-            classes.append("h-full")
-        
+
         return classes
     
     @staticmethod
@@ -450,15 +481,26 @@ class ImageDownloader:
             for node in image_nodes:
                 if node.id in image_urls:
                     url = image_urls[node.id]
+                    if not url:
+                        logger.warning(f"Figma returned null URL for node {node.id}, skipping")
+                        continue
                     # Sanitize filename - replace : with _ for Windows compatibility
                     safe_id = node.id.replace(':', '_').replace('/', '_')
                     filename = f"{safe_id}.png"
                     filepath = images_dir / filename
-                    
+
                     await self._download_file(session, url, filepath)
-                    image_map[node.id] = f"/images/{filename}"
-                    logger.info(f"Downloaded image: {filename}")
-        
+
+                    # Only add to map if file actually downloaded
+                    if filepath.exists() and filepath.stat().st_size > 0:
+                        image_map[node.id] = f"/images/{filename}"
+                        logger.info(f"Downloaded image: {filename}")
+                    else:
+                        logger.warning(f"Image download empty/failed for {node.id}")
+                else:
+                    logger.debug(f"No URL returned by Figma for node {node.id}")
+
+        logger.info(f"Image download complete: {len(image_map)}/{len(image_nodes)} images downloaded")
         return image_map
     
     def _has_image_fill(self, node: FigmaNode) -> bool:
@@ -469,28 +511,49 @@ class ImageDownloader:
         return False
     
     async def _fetch_image_urls(self, file_id: str, node_ids: List[str]) -> Dict[str, str]:
-        """Fetch image URLs from Figma API"""
+        """Fetch image URLs from Figma API — with retry on 429 rate limit"""
         if not node_ids:
             return {}
-        
+
         headers = {"X-Figma-Token": self.figma_token}
-        ids_param = ",".join(node_ids[:100])  # Max 100 at a time
-        url = f"{self.api_base}/images/{file_id}?ids={ids_param}&format=png&scale=2"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("images", {})
+        # Process at most 100 node IDs at a time (Figma API limit)
+        ids_param = ",".join(node_ids[:100])
+        url = f"{self.api_base}/images/{file_id}"
+        params = {"ids": ids_param, "format": "png", "scale": 2}
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            return data.get("images", {})
+                        if response.status == 429:
+                            wait = min(60, 15 * (2 ** attempt))
+                            logger.warning(f"Image API rate limit (429). Waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                            await asyncio.sleep(wait)
+                            continue
+                        logger.warning(f"Image fetch returned {response.status}")
+                        return {}
+            except Exception as e:
+                logger.warning(f"Image fetch attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
         return {}
     
     async def _download_file(self, session: aiohttp.ClientSession, url: str, filepath: Path):
         """Download file from URL"""
-        async with session.get(url) as response:
-            if response.status == 200:
-                content = await response.read()
-                with open(filepath, "wb") as f:
-                    f.write(content)
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    with open(filepath, "wb") as f:
+                        f.write(content)
+                else:
+                    logger.warning(f"Image download returned {response.status}: {url[:80]}")
+        except Exception as e:
+            logger.warning(f"Image download failed: {e}")
 
 
 class ReactCodeGenerator:
@@ -502,7 +565,7 @@ class ReactCodeGenerator:
         
     def generate_component(self, node: FigmaNode, component_name: str, image_map: Dict[str, str]) -> str:
         """Generate React component from Figma node"""
-        jsx = self._generate_jsx(node, image_map, indent=2)
+        jsx = self._generate_jsx(node, image_map, indent=2, parent=None)
         
         # Generate imports
         imports = ["import React from 'react'"]
@@ -522,17 +585,24 @@ export default function {component_name}() {{
 }}
 '''
     
-    def _generate_jsx(self, node: FigmaNode, image_map: Dict[str, str], indent: int = 0) -> str:
-        """Recursively generate JSX"""
+    def _generate_jsx(self, node: FigmaNode, image_map: Dict[str, str], indent: int = 0, parent: Optional[FigmaNode] = None) -> str:
+        """Recursively generate JSX.
+
+        Key behaviours:
+        - Always recurses into ALL children (no longer gated on auto-layout).
+        - Adds `absolute left-[x]px top-[y]px` to children whose parent has no
+          auto-layout, using relative coordinates inside that parent.
+        - Adds `relative` to container nodes that have absolute-positioned children.
+        """
         if not node.visible:
             return ""
-        
+
         ind = "  " * indent
         lines = []
-        
+
         # Determine element type
         element = self._get_element_type(node, image_map)
-        
+
         # Collect all Tailwind classes
         classes = []
         classes.extend(self.tailwind.get_layout_classes(node))
@@ -542,14 +612,36 @@ export default function {component_name}() {{
         classes.extend(self.tailwind.get_text_classes(node))
         classes.extend(self.tailwind.get_effect_classes(node))
         classes.extend(self.responsive.get_responsive_classes(node))
-        
+
+        # --- BUG 4 FIX: absolute positioning when parent has no auto-layout ---
+        if parent is not None and not parent.has_auto_layout and node.absolute_bounds:
+            parent_x = parent.absolute_bounds.get("x", 0)
+            parent_y = parent.absolute_bounds.get("y", 0)
+            node_x = node.absolute_bounds.get("x", 0)
+            node_y = node.absolute_bounds.get("y", 0)
+            rel_x = int(node_x - parent_x)
+            rel_y = int(node_y - parent_y)
+            classes.append("absolute")
+            classes.append(f"left-[{rel_x}px]" if rel_x != 0 else "left-0")
+            classes.append(f"top-[{rel_y}px]" if rel_y != 0 else "top-0")
+
+        # Container nodes with no auto-layout need `relative` so their absolute
+        # children are positioned correctly inside them.
+        if (node.children and not node.has_auto_layout
+                and node.type in ["FRAME", "GROUP", "COMPONENT", "INSTANCE"]):
+            classes.append("relative")
+
         # Build className string
         class_str = " ".join(classes)
-        
+
         # Opening tag
         if element == "img":
-            # Next.js Image component
+            # Next.js Image component — skip if no valid src (empty src crashes build)
             img_src = image_map.get(node.id, "")
+            if not img_src:
+                # Render as a placeholder div with same dimensions
+                lines.append(f'{ind}<div{f" className=\"{class_str}\"" if class_str else ""} />')
+                return "\n".join(lines)
             lines.append(f'{ind}<Image')
             lines.append(f'{ind}  src="{img_src}"')
             lines.append(f'{ind}  alt="{node.name}"')
@@ -559,25 +651,41 @@ export default function {component_name}() {{
                 lines.append(f'{ind}  className="{class_str}"')
             lines.append(f'{ind}/>')
             return "\n".join(lines)
-        
+
         # Regular element
-        lines.append(f'{ind}<{element}{f' className="{class_str}"' if class_str else ""}>')
-        
-        # Text content
+        lines.append(f'{ind}<{element}{f" className=\"{class_str}\"" if class_str else ""}>')
+
+        # Text content — BUG 5 FIX: multi-line handled inline with <br />
+        # Also escape JSX-unsafe chars: { } < & so TypeScript doesn't choke
         if node.type == "TEXT" and node.characters:
-            text = node.characters.replace("\n", "<br/>")
-            lines.append(f'{ind}  {text}')
-        
-        # Children
-        if node.has_auto_layout or node.type in ["FRAME", "GROUP"]:
-            for child in node.children:
-                child_jsx = self._generate_jsx(child, image_map, indent + 1)
-                if child_jsx:
-                    lines.append(child_jsx)
-        
+            def _escape_jsx(s: str) -> str:
+                return (s
+                    .replace('&', '&amp;')
+                    .replace('{', '&#123;')
+                    .replace('}', '&#125;')
+                    .replace('<', '&lt;')
+                    .replace('>', '&gt;'))
+
+            text_content = node.characters
+            if '\n' in text_content:
+                parts = text_content.split('\n')
+                for i, part in enumerate(parts):
+                    if part:
+                        lines.append(f'{ind}  {_escape_jsx(part)}')
+                    if i < len(parts) - 1:
+                        lines.append(f'{ind}  <br />')
+            else:
+                lines.append(f'{ind}  {_escape_jsx(text_content)}')
+
+        # --- BUG 2 FIX: always recurse into ALL children, pass self as parent ---
+        for child in node.children:
+            child_jsx = self._generate_jsx(child, image_map, indent + 1, parent=node)
+            if child_jsx:
+                lines.append(child_jsx)
+
         # Closing tag
         lines.append(f'{ind}</{element}>')
-        
+
         return "\n".join(lines)
     
     def _get_element_type(self, node: FigmaNode, image_map: Dict[str, str]) -> str:
@@ -642,7 +750,22 @@ class AICodeGenerator:
 
             prompt = self._build_prompt(component_name, structure, image_refs)
 
-            messages = []
+            # System message enforces structure at the model level — the user prompt
+            # then provides the mandatory skeleton with exact Figma dimensions.
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a pixel-perfect Figma-to-React code generator. "
+                        "You output ONLY raw TSX — no markdown, no explanation. "
+                        "When the prompt supplies a MANDATORY LAYOUT SKELETON you MUST output "
+                        "that exact outer structure verbatim, filling only the inner {{/* FILL */}} slots. "
+                        "NEVER move, rename, or reorder the outer <div>, <aside>, or right-panel <div>. "
+                        "The sidebar is ALWAYS the first child of the root flex div. "
+                        "NEVER put a full-width <header> before the sidebar."
+                    ),
+                }
+            ]
 
             # If screenshot available, use vision
             if figma_screenshot_path and Path(figma_screenshot_path).exists():
@@ -668,7 +791,7 @@ class AICodeGenerator:
                 model=self.model,
                 messages=messages,
                 temperature=0.1,
-                max_tokens=8000
+                max_tokens=16000
             )
 
             code = response.choices[0].message.content
@@ -794,15 +917,155 @@ class AICodeGenerator:
         if node.id in image_map:
             result["image"] = image_map[node.id]
 
-        # Children (limit depth to 5 levels for better detail)
-        if depth < 5 and node.children:
-            result["children"] = [
-                self._simplify_node(child, image_map, depth + 1)
-                for child in node.children
-                if child.visible
-            ]
+        # Children (limit depth to 8 levels to capture nested sidebars, cards, grids)
+        if depth < 8 and node.children:
+            visible_children = [c for c in node.children if c.visible]
+
+            # Deduplicate repeating groups ONLY at depth >= 4 (where cards live).
+            # Depth 0-3 covers the frame root, sidebar, nav containers and nav items —
+            # these MUST all be serialized in full so the AI generates the complete sidebar.
+            # Cards are typically at depth 4+ (frame > main > content > grid > cards).
+            items_have_images = any(c.id in image_map for c in visible_children)
+            if (depth >= 4
+                    and len(visible_children) >= 5
+                    and all(c.type == visible_children[0].type for c in visible_children)
+                    and items_have_images):
+                result["children"] = [
+                    self._simplify_node(c, image_map, depth + 1)
+                    for c in visible_children[:2]
+                ]
+                result["children_total"] = len(visible_children)
+                result["children_note"] = (
+                    f"Repeating group: {len(visible_children)} image cards total, "
+                    f"first 2 shown as examples. Render ALL {len(visible_children)} in code "
+                    f"using the same pattern with different images from the available list."
+                )
+            else:
+                result["children"] = [
+                    self._simplify_node(child, image_map, depth + 1)
+                    for child in visible_children
+                ]
 
         return result
+
+    def _analyze_layout(self, structure: Dict):
+        """Detect top-level layout pattern.
+
+        Returns: (hint_str, layout_info) where layout_info is a dict or None.
+        layout_info keys: type, root_bg, sidebar, topbar, content_bg, total_w, total_h
+        """
+        children = structure.get("children", [])
+        if len(children) < 2:
+            return "", None
+
+        total_w = structure.get("w", 1440) or 1440
+        total_h = structure.get("h", 900) or 900
+        hints = []
+        sidebar = None
+        topbar = None
+        content = None
+
+        for i, child in enumerate(children[:5]):
+            w = child.get("w", 0)
+            h = child.get("h", 0)
+            name = child.get("name", f"child_{i}")
+            bg = child.get("bg", "")
+
+            # Sidebar: narrow (< 28% width) AND tall (> 70% height)
+            if w > 0 and h > 0 and w < total_w * 0.28 and h > total_h * 0.70:
+                if sidebar is None:  # take the first match
+                    sidebar = {"name": name, "w": w, "h": h, "bg": bg}
+                    hints.append(
+                        f"SIDEBAR DETECTED: \"{name}\" (w={w}px, h={h}px, bg={bg})"
+                    )
+            # Topbar: wide (> 55% width) AND short (< 18% height)
+            elif w > total_w * 0.55 and 0 < h < total_h * 0.18:
+                if topbar is None:
+                    topbar = {"name": name, "w": w, "h": h, "bg": bg}
+                    hints.append(
+                        f"TOPBAR DETECTED: \"{name}\" (w={w}px, h={h}px, bg={bg})"
+                    )
+            # Content panel: wide (> 50% width) AND tall (> 50% height)
+            elif w > total_w * 0.50 and h > total_h * 0.50:
+                if content is None:
+                    content = {"name": name, "w": w, "h": h, "bg": bg}
+
+        if not sidebar:
+            return ("\n".join(hints) + "\n") if hints else "", None
+
+        layout_info = {
+            "type": "sidebar+content",
+            "root_bg": structure.get("bg", ""),
+            "sidebar": sidebar,
+            "topbar": topbar,
+            "content_bg": content.get("bg", "") if content else "",
+            "total_w": total_w,
+            "total_h": total_h,
+        }
+        hint_str = ("LAYOUT HINTS:\n" + "\n".join(hints) + "\n") if hints else ""
+        return hint_str, layout_info
+
+    def _build_layout_skeleton(self, layout_info: Dict, component_name: str) -> str:
+        """Build the MANDATORY JSX layout skeleton from detected Figma structure.
+
+        The skeleton uses the exact pixel dimensions and colours from Figma so the
+        AI cannot accidentally produce the wrong outer structure.  It only needs to
+        fill in the inner content slots marked with {{/* FILL: ... */}}.
+        """
+        sidebar = layout_info["sidebar"]
+        topbar = layout_info.get("topbar")
+        root_bg = layout_info.get("root_bg", "")
+        content_bg = layout_info.get("content_bg", "")
+
+        sidebar_w = sidebar["w"]
+        sidebar_bg = sidebar.get("bg", "")
+
+        def bg_cls(hex_val):
+            return f" bg-[{hex_val}]" if hex_val and hex_val.startswith("#") else ""
+
+        root_bg_cls = bg_cls(root_bg) or bg_cls(sidebar_bg)
+        sidebar_bg_cls = bg_cls(sidebar_bg)
+        content_bg_cls = bg_cls(content_bg)
+
+        if topbar:
+            topbar_h = topbar.get("h", 64)
+            topbar_bg = topbar.get("bg", "")
+            topbar_bg_cls = bg_cls(topbar_bg) if topbar_bg else " bg-white"
+            right_panel = (
+                f'  <div className="flex-1 flex flex-col min-w-0 overflow-hidden{content_bg_cls}">\n'
+                f'    <header className="flex-shrink-0 h-[{topbar_h}px]{topbar_bg_cls} flex items-center px-6 border-b border-black/10">\n'
+                f'      {{/* FILL: topbar — page title, search bar, action buttons. Render ALL elements visible in the screenshot. */}}\n'
+                f'    </header>\n'
+                f'    <main className="flex-1 overflow-y-auto">\n'
+                f'      {{/* FILL: filter tabs, card grid, tables — ALL content visible in the screenshot. */}}\n'
+                f'    </main>\n'
+                f'  </div>'
+            )
+        else:
+            right_panel = (
+                f'  <div className="flex-1 flex flex-col min-w-0 overflow-hidden{content_bg_cls}">\n'
+                f'    <main className="flex-1 overflow-y-auto">\n'
+                f'      {{/* FILL: ALL content visible in the screenshot — headers, filters, grids, tables. */}}\n'
+                f'    </main>\n'
+                f'  </div>'
+            )
+
+        return (
+            f'━━━ MANDATORY LAYOUT SKELETON — DO NOT CHANGE THE OUTER STRUCTURE ━━━\n'
+            f'Your output MUST start with exactly this wrapper (fill in the {{/* FILL */}} slots):\n\n'
+            f'import Image from \'next/image\'\n\n'
+            f'export default function {component_name}() {{\n'
+            f'  return (\n'
+            f'    <div className="flex h-screen overflow-hidden{root_bg_cls}">\n'
+            f'      <aside className="w-[{sidebar_w}px] flex-shrink-0 h-full flex flex-col{sidebar_bg_cls} overflow-y-auto">\n'
+            f'        {{/* FILL: logo + ALL nav items exactly as in the screenshot. */}}\n'
+            f'      </aside>\n'
+            f'{right_panel}\n'
+            f'    </div>\n'
+            f'  )\n'
+            f'}}\n\n'
+            f'Replace each {{/* FILL: ... */}} with real JSX. DO NOT change any className on the outer divs/aside.'
+        )
 
     def _build_prompt(self, component_name: str, structure: Dict, image_refs: List[str]) -> str:
         """Build the prompt for AI code generation"""
@@ -810,43 +1073,54 @@ class AICodeGenerator:
 
         # Truncate structure to avoid token limits
         structure_str = json.dumps(structure, indent=1)
-        if len(structure_str) > 4000:
-            structure_str = structure_str[:4000] + "\n... (truncated)"
+        if len(structure_str) > 18000:
+            structure_str = structure_str[:18000] + "\n... (truncated - rely on the screenshot for remaining details)"
 
-        return f"""Generate a React + Tailwind CSS component that EXACTLY matches the design shown in the image.
+        # Detect layout and build mandatory skeleton if sidebar found
+        layout_hint, layout_info = self._analyze_layout(structure)
+
+        if layout_info and layout_info.get("type") == "sidebar+content":
+            skeleton_section = self._build_layout_skeleton(layout_info, component_name) + "\n\n"
+        else:
+            skeleton_section = ""
+
+        return f"""You are a pixel-perfect Figma-to-React converter. Reproduce EVERY element in the screenshot as a single React + Tailwind CSS component.
 
 Component name: {component_name}
 
-Available images (use Next.js Image component with these exact paths):
+Available images (use these exact paths — never invent paths):
 {images_list}
 
-The structure data below contains the EXACT CSS properties from Figma for each element:
-- "bg": exact background color (use as bg-[#hex])
-- "css.color": exact text color (use as text-[#hex])
-- "css.fontSize": exact font size (use as text-[Xpx])
-- "css.fontWeight": exact weight (use font-normal/medium/semibold/bold)
-- "layout": flex direction ("horizontal" = flex-row, "vertical" = flex-col)
-- "justify"/"align": flex alignment
-- "gap": spacing between items (use gap-[Xpx])
-- "padding": padding values (use p-[Xpx] or pt/pr/pb/pl)
-- "radius": border radius (use rounded-[Xpx])
-- "border": border width and color
-- "shadow": box shadow
-- "w"/"h": width/height in pixels
-- "widthMode"/"heightMode": "fill" means use w-full/h-full
-
-Figma structure:
+{layout_hint}{skeleton_section}Figma structure data (exact colors, sizes, spacing — use these values):
 {structure_str}
 
-REQUIREMENTS:
-1. `import Image from 'next/image'` for images, `export default function {component_name}()`
-2. Use EXACT hex colors from the structure data: bg-[#1a1a2e], text-[#667eea], etc.
-3. Use EXACT pixel values for spacing/sizing: w-[240px], gap-[16px], p-[24px], text-[14px]
-4. Match the layout precisely from the image - sidebar, grid, cards, spacing
-5. Include ALL text content from the "text" fields in the structure
-6. For image elements, use: <Image src="..." alt="..." width={{W}} height={{H}} className="object-cover" />
-7. Static component only - no useState/useEffect
-8. Output ONLY the TSX code, no explanations or markdown"""
+━━━ RENDER EVERY SECTION IN FULL ━━━
+
+SIDEBAR RULES:
+- Generate ALL navigation items visible in the screenshot (every icon + label pair, every section divider).
+- Use exact background color and item spacing from structure data.
+- Active/selected nav item: highlighted background or border-left accent.
+
+HEADER / TOPBAR RULES (goes INSIDE the right panel, not above the sidebar):
+- Page title (with back arrow if present), search bar, date range picker, action buttons.
+- Exact colors and border from structure data.
+
+CARD GRID RULES:
+- Count columns from the screenshot and use `grid grid-cols-N gap-[Xpx]`.
+- Generate ALL visible cards as an inline data array mapped to JSX.
+- Each card: background image with `<Image src="..." fill className="object-cover" alt="...">` inside `<div className="relative w-full h-[Xpx] overflow-hidden">`, overlay gradient, badge(s), title, meta text, status chip, action buttons.
+
+FILTER TABS RULES:
+- ALL tabs with label + count badge; active tab uses exact highlight color from structure.
+
+━━━ HARD RULES ━━━
+1. Output raw TSX only — no markdown fences, no explanation.
+2. Every {{/* FILL */}} slot gets real JSX — no empty comments left behind.
+3. EXACT colors: bg-[#rrggbb] from structure. NEVER substitute named Tailwind colors.
+4. EXACT sizes: w-[Xpx], gap-[Xpx], text-[Xpx] from structure data.
+5. Images: import Image from 'next/image'. Use only paths from the Available Images list. Never empty src.
+6. Static only — no useState, no useEffect.
+7. JSX text nodes: escape {{ as &#123; and }} as &#125;."""
 
 
 class ProductionFigmaToCode:
@@ -860,14 +1134,67 @@ class ProductionFigmaToCode:
         self.ai_generator = AICodeGenerator()
         self.image_downloader = ImageDownloader(figma_token)
     
+    async def _export_frame_image(self, file_id: str, node_id: str, output_dir: Path) -> Optional[str]:
+        """Export a specific Figma frame as PNG using the images API.
+
+        Caches the result so repeated runs don't re-hit the API.
+        Returns the local file path, or None if export fails.
+        """
+        safe_id = node_id.replace(":", "_").replace(";", "_")
+        cache_path = output_dir / f"_frame_{safe_id}.png"
+
+        # Return cached file if valid
+        if cache_path.exists() and cache_path.stat().st_size > 10_000:
+            logger.info(f"Using cached frame screenshot: {cache_path.name}")
+            return str(cache_path)
+
+        try:
+            headers = {"X-Figma-Token": self.figma_token}
+            resp = requests.get(
+                f"{self.api_base}/images/{file_id}",
+                headers=headers,
+                params={"ids": node_id, "format": "png", "scale": "1"},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Figma images API returned {resp.status_code} for frame {node_id}")
+                return None
+
+            image_url = resp.json().get("images", {}).get(node_id)
+            if not image_url:
+                logger.warning(f"No image URL returned for frame {node_id}")
+                return None
+
+            # Download the rendered frame PNG from S3
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    image_url, timeout=aiohttp.ClientTimeout(total=60)
+                ) as r:
+                    if r.status == 200:
+                        data = await r.read()
+                        if len(data) > 1000:
+                            cache_path.write_bytes(data)
+                            logger.info(
+                                f"Frame screenshot exported: {cache_path.name} "
+                                f"({len(data) // 1024}KB)"
+                            )
+                            return str(cache_path)
+                    logger.warning(f"Frame image download failed: HTTP {r.status}")
+        except Exception as e:
+            logger.warning(f"Could not export frame image for {node_id}: {e}")
+
+        return None
+
     async def convert(self, figma_url: str, output_dir: Path, figma_screenshot_path: str = None) -> Dict:
         """Convert Figma to production-ready code"""
         try:
             file_id = self._extract_file_id(figma_url)
             logger.info(f"🎨 Converting Figma file: {file_id}")
             
-            # Fetch Figma file
-            figma_data = self._fetch_file(file_id)
+            # Fetch Figma file — run in executor so time.sleep inside _fetch_file
+            # doesn't block the asyncio event loop during rate-limit waits.
+            loop = asyncio.get_event_loop()
+            figma_data = await loop.run_in_executor(None, self._fetch_file, file_id)
             logger.info("✅ Fetched Figma data")
             
             # Parse structure
@@ -890,36 +1217,77 @@ class ProductionFigmaToCode:
             components_dir = output_dir / "src" / "components"
             components_dir.mkdir(parents=True, exist_ok=True)
             
+            # Ensure public/images directory always exists so git commits it
+            (output_dir / "public" / "images").mkdir(parents=True, exist_ok=True)
+
             # Download images
             all_nodes = []
             for frame in frames:
                 all_nodes.extend(self.code_generator._get_all_nodes(frame))
             image_map = await self.image_downloader.download_images(file_id, all_nodes, output_dir)
             logger.info(f"✅ Downloaded {len(image_map)} images")
-            
-            # Generate components - try AI first, fall back to programmatic
+
+            # ——— Pre-fetch file thumbnail as fallback visual reference ———
+            _file_thumbnail_path = figma_screenshot_path  # use caller-provided if available
+            if not _file_thumbnail_path:
+                thumbnail_url = figma_data.get("thumbnailUrl")
+                if thumbnail_url:
+                    try:
+                        thumb_path = output_dir / "_figma_thumb.png"
+                        async with aiohttp.ClientSession() as _thumb_session:
+                            async with _thumb_session.get(
+                                thumbnail_url, timeout=aiohttp.ClientTimeout(total=30)
+                            ) as _resp:
+                                if _resp.status == 200:
+                                    thumb_path.write_bytes(await _resp.read())
+                                    _file_thumbnail_path = str(thumb_path)
+                                    logger.info(f"File thumbnail ready: {thumb_path.name} ({thumb_path.stat().st_size // 1024}KB)")
+                    except Exception as _e:
+                        logger.warning(f"Could not fetch file thumbnail: {_e}")
+
+            # Generate components
+            # AI is enabled by default — produces pixel-perfect output using Groq vision model.
+            # Set USE_AI=false to force programmatic-only mode (faster, lower quality).
+            use_ai = os.getenv('USE_AI', 'true').lower() == 'true'
+            logger.info(f"🔧 Code generation mode: {'AI (pixel-perfect)' if use_ai else 'PROGRAMMATIC'}")
+
             generated = []
             for frame in frames:
                 comp_name = self._sanitize_name(frame.name)
                 logger.info(f"🔨 Generating: {comp_name}")
 
+                # ——— Per-frame screenshot: gives AI the exact frame to replicate ———
+                # Try the Figma images API first (highest quality, frame-specific).
+                # Fall back to file thumbnail if export fails (e.g. rate limit).
+                _ai_screenshot_path = await self._export_frame_image(file_id, frame.id, output_dir)
+                if _ai_screenshot_path:
+                    logger.info(f"Using per-frame screenshot for AI: {Path(_ai_screenshot_path).name}")
+                elif _file_thumbnail_path:
+                    _ai_screenshot_path = _file_thumbnail_path
+                    logger.info(f"Using file thumbnail as fallback for AI")
+                else:
+                    logger.warning(f"No screenshot available for AI — quality may be reduced")
+
                 code = None
 
-                # Try AI-powered generation first (much better quality)
-                if self.ai_generator.available:
-                    logger.info(f"🤖 Using AI code generation for {comp_name}")
-                    code = self.ai_generator.generate_component(
-                        frame, comp_name, image_map, figma_screenshot_path
-                    )
-                    if code:
-                        logger.info(f"✅ AI generated {comp_name} successfully")
+                if use_ai:
+                    if self.ai_generator.available:
+                        logger.info(f"🤖 [AI PATH] Generating {comp_name} with Groq vision model")
+                        code = self.ai_generator.generate_component(
+                            frame, comp_name, image_map, _ai_screenshot_path
+                        )
+                        if code:
+                            logger.info(f"✅ [AI PATH] {comp_name} generated successfully")
+                        else:
+                            logger.warning(f"⚠️ [AI PATH] Failed for {comp_name}, falling back to programmatic")
                     else:
-                        logger.warning(f"⚠️ AI generation failed, falling back to programmatic")
+                        logger.warning(f"⚠️ USE_AI=true but GROQ_API_KEY not set — using programmatic path")
 
-                # Fall back to programmatic generation
+                # Programmatic generation (default path or AI fallback)
                 if not code:
-                    logger.info(f"⚙️ Using programmatic generation for {comp_name}")
+                    logger.info(f"⚙️ [PROGRAMMATIC PATH] Generating {comp_name}")
                     code = self.code_generator.generate_component(frame, comp_name, image_map)
+                    logger.info(f"✅ [PROGRAMMATIC PATH] {comp_name} generated successfully")
 
                 comp_file = components_dir / f"{comp_name}.tsx"
                 with open(comp_file, "w", encoding="utf-8") as f:
@@ -928,7 +1296,9 @@ class ProductionFigmaToCode:
                 generated.append({
                     "name": comp_name,
                     "file": str(comp_file),
-                    "original": frame.name
+                    "original": frame.name,
+                    "node_id": frame.id,
+                    "node_type": frame.type,
                 })
             
             # Generate supporting files (complete Next.js App Router structure)
@@ -940,14 +1310,23 @@ class ProductionFigmaToCode:
             self._generate_tsconfig(output_dir)
             self._generate_gitignore(output_dir)
             self._generate_readme(output_dir, figma_url)
-            
+
+            # Write component registry — must come AFTER all TSX files are on disk
+            registry_path = self._write_component_registry(
+                output_dir, file_id, figma_data.get("name", "Untitled"), generated
+            )
+
             logger.info("🎉 Conversion complete!")
-            
+
             return {
                 "success": True,
                 "components": generated,
                 "images": len(image_map),
-                "output_dir": str(output_dir)
+                "output_dir": str(output_dir),
+                "file_name": figma_data.get("name", "Untitled"),
+                "first_frame_node_id": frames[0].id if frames else None,
+                "thumbnail_url": figma_data.get("thumbnailUrl"),  # Pre-generated, no extra API call
+                "registry_path": str(registry_path),
             }
             
         except Exception as e:
@@ -959,21 +1338,22 @@ class ProductionFigmaToCode:
     
     def _fetch_file(self, file_id: str) -> Dict:
         """Fetch Figma file with caching and retry logic - ⭐ UPDATED"""
-        # Check cache first
-        cache_dir = Path("figma_cache")
+        # Check cache first — use absolute path so it's stable regardless of cwd
+        # __file__ is mcp-automation/src/tools/converter.py → .parent×3 = mcp-automation/
+        cache_dir = Path(__file__).parent.parent.parent / "figma_cache"
         cache_dir.mkdir(exist_ok=True)
         cache_file = cache_dir / f"{file_id}.json"
         
-        # Use cache if exists and is less than 1 hour old
+        # Use cache if exists and is less than 7 days old
         if cache_file.exists():
             cache_age = time.time() - cache_file.stat().st_mtime
-            if cache_age < 3600:  # 1 hour = 3600 seconds
+            if cache_age < 604800:  # 7 days = 604800 seconds
                 logger.info(f"✅ Using cached Figma data (age: {int(cache_age/60)} minutes)")
                 print(f"   ✅ Using cached Figma data (saved {int(cache_age/60)} min ago)")
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
             else:
-                logger.info(f"Cache expired (age: {int(cache_age/60)} minutes), fetching fresh data")
+                logger.info(f"Cache expired (age: {int(cache_age/3600)} hours), fetching fresh data")
         
         # Fetch from API with retry logic
         headers = {"X-Figma-Token": self.figma_token}
@@ -1081,10 +1461,12 @@ class ProductionFigmaToCode:
 @tailwind components;
 @tailwind utilities;
 
+html,
 body {
   margin: 0;
   padding: 0;
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
 }
 '''
         with open(app_dir / "globals.css", "w", encoding="utf-8") as f:
@@ -1129,11 +1511,9 @@ export default function RootLayout({
 
 export default function Home() {{
   return (
-    <main className="min-h-screen bg-gray-50">
-      <div className="w-full">
-        {renders}
-      </div>
-    </main>
+    <>
+      {renders}
+    </>
   )
 }}
 '''
@@ -1201,11 +1581,12 @@ module.exports = {
             f.write(config)
 
     def _generate_next_config(self, output_dir: Path):
-        """Generate next.config.js"""
+        """Generate next.config.js with static export for fast local rendering"""
         config = '''/** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: 'export',   // Generates static HTML in out/ — enables fast file:// preview
   images: {
-    unoptimized: true,
+    unoptimized: true, // Required for static export with next/image
   },
 }
 
@@ -1254,6 +1635,129 @@ out/
         with open(output_dir / ".gitignore", "w", encoding="utf-8") as f:
             f.write(gitignore)
     
+    def _write_component_registry(
+        self,
+        output_dir: Path,
+        file_id: str,
+        file_name: str,
+        generated: List[Dict],
+    ) -> Path:
+        """
+        Write component_registry.json to the project root.
+
+        Merges with any existing registry:
+          - Updates entries whose code changed (new hash → new last_updated)
+          - Preserves last_updated for unchanged entries
+          - Adds entries for newly generated components
+          - Removes entries for Figma nodes no longer in this run
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        registry_path = output_dir / "component_registry.json"
+
+        # Load existing registry for merge
+        existing: Dict = {}
+        if registry_path.exists():
+            try:
+                with open(registry_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+
+        def md5_file(path: Path) -> str:
+            if not path.exists():
+                return ""
+            return hashlib.md5(path.read_bytes()).hexdigest()
+
+        def parse_local_imports(path: Path) -> List[str]:
+            """Return sorted list of local src/components/*.tsx paths imported by this file."""
+            if not path.exists():
+                return []
+            text = path.read_text(encoding="utf-8")
+            deps = []
+            for m in re.finditer(
+                r"from\s+['\"](?:@/|\.\./)components/([^'\"]+)['\"]", text
+            ):
+                comp_name = m.group(1)
+                for ext in (".tsx", ".ts", ".jsx", ".js"):
+                    if comp_name.endswith(ext):
+                        comp_name = comp_name[: -len(ext)]
+                        break
+                deps.append(f"src/components/{comp_name}.tsx")
+            return sorted(set(deps))
+
+        # Current node ID set — used to prune stale entries from a previous run
+        current_node_ids = {g["node_id"] for g in generated if g.get("node_id")}
+
+        # ── Components ─────────────────────────────────────────────────────────
+        existing_components: Dict = existing.get("components", {})
+        # Drop entries whose Figma node no longer exists
+        pruned: Dict = {
+            k: v for k, v in existing_components.items() if k in current_node_ids
+        }
+
+        for g in generated:
+            node_id = g.get("node_id", "")
+            file_abs = Path(g["file"])
+            rel_path = file_abs.relative_to(output_dir).as_posix()
+            file_hash = md5_file(file_abs)
+            deps = parse_local_imports(file_abs)
+
+            if node_id in pruned:
+                old = pruned[node_id]
+                pruned[node_id] = {
+                    "name": g["name"],
+                    "file_path": rel_path,
+                    "figma_node_type": g.get("node_type", "FRAME"),
+                    "code_hash": file_hash,
+                    # Preserve original timestamp when file is unchanged
+                    "last_updated": now if file_hash != old.get("code_hash") else old.get("last_updated", now),
+                    "dependencies": deps,
+                }
+            else:
+                pruned[node_id] = {
+                    "name": g["name"],
+                    "file_path": rel_path,
+                    "figma_node_type": g.get("node_type", "FRAME"),
+                    "code_hash": file_hash,
+                    "last_updated": now,
+                    "dependencies": deps,
+                }
+
+        # ── Pages ──────────────────────────────────────────────────────────────
+        # src/app/page.tsx is generated from all frames so it has no single
+        # Figma frame ID — use the stable key "root_page".
+        page_file = output_dir / "src" / "app" / "page.tsx"
+        page_hash = md5_file(page_file)
+        page_deps = parse_local_imports(page_file)
+        existing_pages: Dict = existing.get("pages", {})
+        old_page = existing_pages.get("root_page", {})
+        pages = {
+            "root_page": {
+                "name": "Home",
+                "file_path": "src/app/page.tsx",
+                "code_hash": page_hash,
+                "last_updated": now if page_hash != old_page.get("code_hash") else old_page.get("last_updated", now),
+                "dependencies": page_deps,
+            }
+        }
+
+        # ── Assemble and write ─────────────────────────────────────────────────
+        registry = {
+            "generated_at": now,
+            "figma_file_id": file_id,
+            "figma_file_name": file_name,
+            "components": pruned,
+            "pages": pages,
+        }
+
+        with open(registry_path, "w", encoding="utf-8") as f:
+            json.dump(registry, f, indent=2)
+
+        logger.info(
+            f"📋 Registry: {len(pruned)} component(s), {len(pages)} page(s) → {registry_path.name}"
+        )
+        return registry_path
+
     def _generate_readme(self, output_dir: Path, figma_url: str):
         """Generate README"""
         readme = f'''# Figma to Code - Production Ready

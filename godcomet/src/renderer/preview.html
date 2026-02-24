@@ -245,6 +245,75 @@
       color: #fff;
     }
 
+    .btn-change {
+      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+      color: white;
+    }
+
+    .btn-change:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 15px rgba(245, 158, 11, 0.4);
+    }
+
+    /* Request Changes inline form */
+    .change-form {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+      padding: 0 24px;
+    }
+
+    .change-form.visible {
+      display: flex;
+    }
+
+    .change-form textarea {
+      width: 100%;
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(245, 158, 11, 0.5);
+      border-radius: 6px;
+      color: #fff;
+      font-size: 14px;
+      padding: 10px 14px;
+      resize: vertical;
+      min-height: 70px;
+      font-family: inherit;
+    }
+
+    .change-form textarea:focus {
+      outline: none;
+      border-color: #f59e0b;
+    }
+
+    .change-form .form-row {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    /* Gate label in header */
+    .gate-label {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 12px;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .gate-label.gate1 {
+      background: rgba(102, 126, 234, 0.2);
+      color: #667eea;
+      border: 1px solid rgba(102, 126, 234, 0.4);
+    }
+
+    .gate-label.gate2 {
+      background: rgba(16, 185, 129, 0.2);
+      color: #10b981;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+
     /* Loading State */
     .loading {
       display: flex;
@@ -337,15 +406,29 @@
     const app = document.getElementById('app');
     const loading = document.getElementById('loading');
 
-    // Listen for preview data from main process
+    // Listen for preview data from main process (gate determined by message.type)
     if (window.api && window.api.onPreviewData) {
       window.api.onPreviewData((data) => {
         console.log('Preview data received:', data);
-        // Data may be the full WebSocket message or just the preview object
+        workflowId = data.workflow_id;
         const preview = data.preview || data;
-        workflowId = data.workflow_id || preview.workflow_id;
         previewData = preview;
-        renderPreview(preview);
+
+        if (data.type === 'awaiting_deploy_approval') {
+          renderGate2Preview(preview);
+        } else {
+          // awaiting_code_approval or legacy approval_required
+          renderGate1Preview(preview);
+        }
+      });
+    }
+
+    // Gate 2 fires while window is already open (preview window was showing Gate 1)
+    if (window.api && window.api.onDeployApprovalRequired) {
+      window.api.onDeployApprovalRequired((data) => {
+        console.log('Deploy approval required:', data);
+        workflowId = data.workflow_id;
+        renderGate2Preview(data.preview || data);
       });
     }
 
@@ -357,16 +440,62 @@
       });
     }
 
-    function renderPreview(data) {
-      const score = data.audit_result?.score || 0;
+    // ======================================================================
+    // GATE 1 — Code review (before GitHub push)
+    // ======================================================================
+    function renderGate1Preview(data) {
+      const score = data.audit_score != null ? data.audit_score : (data.audit_result?.score || 0);
       const threshold = data.audit_result?.threshold || 0.95;
       const passed = score >= threshold;
       const issues = data.audit_result?.issues || [];
+      const figmaUrl = data.figma_url || '';
+      const projectPath = data.project_path || '';
+      const generatedFiles = data.generated_files || [];
+
+      let figmaContent;
+      if (data.figma_screenshot) {
+        figmaContent = `<img class="preview-image" src="${formatImageSrc(data.figma_screenshot)}" alt="Figma Design" />`;
+      } else {
+        figmaContent = `
+          <div class="placeholder">
+            <div class="placeholder-icon">🎨</div>
+            <p style="margin-bottom:10px;">Figma screenshot not captured</p>
+            <p style="font-size:12px;color:#6b7280;margin-bottom:16px;">
+              API rate limit hit — screenshot skipped to keep workflow moving
+            </p>
+            ${figmaUrl ? `<a href="${figmaUrl}" target="_blank" style="
+              display:inline-block;padding:8px 18px;background:#667eea;color:#fff;
+              border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;">
+              Open in Figma
+            </a>` : ''}
+          </div>`;
+      }
+
+      let renderedContent;
+      if (data.rendered_screenshot) {
+        renderedContent = `<img class="preview-image" src="${formatImageSrc(data.rendered_screenshot)}" alt="Generated Website" />`;
+      } else {
+        renderedContent = `
+          <div class="placeholder">
+            <div class="placeholder-icon">💻</div>
+            <p style="margin-bottom:10px;">Render screenshot not captured</p>
+            <p style="font-size:12px;color:#6b7280;margin-bottom:8px;">
+              Dev server render skipped — code was still generated successfully
+            </p>
+            ${projectPath ? `<p style="font-size:11px;color:#4b5563;word-break:break-all;margin-bottom:14px;padding:0 16px;">
+              ${projectPath}
+            </p>` : ''}
+            <p style="font-size:12px;color:#9ca3af;">
+              You can still approve to proceed — the code is ready
+            </p>
+          </div>`;
+      }
 
       app.innerHTML = `
         <div class="header">
-          <h1><span>GodComet</span> Preview</h1>
+          <h1><span>GodComet</span> Code Review <span class="gate-label gate1">Gate 1</span></h1>
           <div class="score-badge">
+            ${figmaUrl ? `<a href="${figmaUrl}" target="_blank" style="font-size:13px;color:#667eea;text-decoration:none;margin-right:8px;">Open Figma ↗</a>` : ''}
             <div class="score ${passed ? 'pass' : 'fail'}">${(score * 100).toFixed(0)}%</div>
             <div class="threshold">Threshold: ${(threshold * 100).toFixed(0)}%</div>
           </div>
@@ -375,32 +504,16 @@
         <div class="preview-container">
           <div class="preview-panel">
             <div class="panel-header">
-              <div class="label">
-                <span>🎨</span>
-                <span>Figma Original</span>
-              </div>
+              <div class="label"><span>🎨</span><span>Figma Original</span></div>
             </div>
-            <div class="preview-image-container">
-              ${data.figma_screenshot
-                ? `<img class="preview-image" src="${formatImageSrc(data.figma_screenshot)}" alt="Figma Design" />`
-                : `<div class="placeholder"><div class="placeholder-icon">🎨</div><p>Figma screenshot not available</p></div>`
-              }
-            </div>
+            <div class="preview-image-container">${figmaContent}</div>
           </div>
-
           <div class="preview-panel">
             <div class="panel-header">
-              <div class="label">
-                <span>💻</span>
-                <span>Generated Website</span>
-              </div>
+              <div class="label"><span>💻</span><span>Generated Website</span></div>
+              ${generatedFiles.length ? `<span style="font-size:12px;color:#6b7280;">${generatedFiles.length} files</span>` : ''}
             </div>
-            <div class="preview-image-container">
-              ${data.rendered_screenshot
-                ? `<img class="preview-image" src="${formatImageSrc(data.rendered_screenshot)}" alt="Generated Website" />`
-                : `<div class="placeholder"><div class="placeholder-icon">💻</div><p>Rendered screenshot not available</p></div>`
-              }
-            </div>
+            <div class="preview-image-container">${renderedContent}</div>
           </div>
         </div>
 
@@ -414,7 +527,7 @@
               ? '<div style="color: #10b981; padding: 8px 0;">No issues detected! Design matches perfectly.</div>'
               : issues.map(issue => `
                   <div class="issue-item ${issue.severity === 'critical' ? 'critical' : ''}">
-                    ${issue.element || issue.type}: ${issue.description || issue.fix}
+                    ${issue.element || issue.type || ''}: ${issue.description || issue.fix || ''}
                     <div class="fix-note">Will auto-fix on retry</div>
                   </div>
                 `).join('')
@@ -422,12 +535,89 @@
           </div>
         </div>
 
-        <div class="action-bar">
-          <button class="btn btn-approve" onclick="handleApprove()">
-            ✅ Approve & Deploy
+        <div class="action-bar" id="actionBar" style="flex-direction:column;align-items:center;gap:12px;">
+          <div style="display:flex;gap:12px;justify-content:center;">
+            <button class="btn btn-approve" onclick="handleCodeApprove()">
+              Approve Code &rarr;
+            </button>
+            <button class="btn btn-change" onclick="toggleChangeForm()">
+              Request Changes
+            </button>
+            <button class="btn btn-reject" onclick="handleCodeReject()">
+              Reject &amp; Retry
+            </button>
+            <button class="btn btn-secondary" onclick="handleCancel()">
+              Cancel
+            </button>
+          </div>
+          <div class="change-form" id="changeForm">
+            <textarea id="changeInstruction" placeholder="Describe what needs to be changed (e.g. 'make the header font larger, use blue for buttons')"></textarea>
+            <div class="form-row">
+              <button class="btn btn-secondary" onclick="toggleChangeForm()" style="padding:8px 20px;font-size:13px;">
+                Cancel
+              </button>
+              <button class="btn btn-change" onclick="handleCodeChangeRequest()" style="padding:8px 20px;font-size:13px;">
+                Submit Changes
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // ======================================================================
+    // GATE 2 — Deploy approval (after GitHub push)
+    // ======================================================================
+    function renderGate2Preview(data) {
+      const githubUrl = data.github_url || '';
+      const repoName = data.repo_name || '';
+      const projectPath = data.project_path || '';
+      const score = data.audit_score != null ? data.audit_score : 0;
+
+      app.innerHTML = `
+        <div class="header">
+          <h1><span>GodComet</span> Deploy Approval <span class="gate-label gate2">Gate 2</span></h1>
+          <div class="score-badge">
+            ${score ? `<div class="score ${score >= 0.7 ? 'pass' : 'fail'}">${(score * 100).toFixed(0)}%</div>` : ''}
+          </div>
+        </div>
+
+        <div class="preview-container" style="align-items:center;justify-content:center;">
+          <div style="text-align:center;padding:40px;max-width:600px;">
+            <div style="font-size:56px;margin-bottom:20px;">🚀</div>
+            <h2 style="font-size:22px;font-weight:700;margin-bottom:12px;color:#fff;">
+              Code pushed to GitHub successfully!
+            </h2>
+            <p style="color:#9ca3af;font-size:15px;margin-bottom:24px;line-height:1.6;">
+              Your generated project is now on GitHub. Do you want to deploy it to Vercel (live website)?
+            </p>
+
+            ${githubUrl ? `
+              <div style="margin-bottom:24px;">
+                <a href="${githubUrl}" target="_blank" style="
+                  display:inline-flex;align-items:center;gap:8px;
+                  padding:10px 22px;background:rgba(255,255,255,0.07);
+                  border:1px solid rgba(255,255,255,0.15);
+                  border-radius:8px;color:#fff;text-decoration:none;font-size:14px;font-weight:500;">
+                  View on GitHub: ${repoName || githubUrl}
+                </a>
+              </div>
+            ` : ''}
+
+            ${projectPath ? `
+              <p style="font-size:11px;color:#4b5563;word-break:break-all;">
+                ${projectPath}
+              </p>
+            ` : ''}
+          </div>
+        </div>
+
+        <div class="action-bar" id="actionBar">
+          <button class="btn btn-approve" onclick="handleDeployApprove()">
+            Deploy to Vercel
           </button>
-          <button class="btn btn-reject" onclick="handleReject()">
-            🔄 Reject & Retry
+          <button class="btn btn-secondary" onclick="handleDeployReject()">
+            Skip Deploy
           </button>
           <button class="btn btn-secondary" onclick="handleCancel()">
             Cancel
@@ -446,14 +636,12 @@
             <div class="complete-urls">
               ${result.github_url ? `
                 <div class="url-item">
-                  <span>🐙</span>
                   <span>GitHub:</span>
                   <a href="${result.github_url}" target="_blank">${result.github_url}</a>
                 </div>
               ` : ''}
               ${result.vercel_url ? `
                 <div class="url-item">
-                  <span>🌐</span>
                   <span>Live Site:</span>
                   <a href="${result.vercel_url}" target="_blank">${result.vercel_url}</a>
                 </div>
@@ -472,62 +660,104 @@
 
     function formatImageSrc(src) {
       if (!src) return '';
-      // If it's a base64 string
       if (src.startsWith('data:')) return src;
-      // If it's a base64 without prefix
-      if (src.length > 100 && !src.includes('/')) {
+      if (src.length > 100 && !src.includes('/') && !src.includes('\\')) {
         return `data:image/png;base64,${src}`;
       }
-      // If it's a file path, convert to file:// URL
-      if (src.includes('\\') || src.includes('/')) {
+      if (src.includes('\\') || src.startsWith('/')) {
         return `file://${src.replace(/\\/g, '/')}`;
       }
       return src;
     }
 
-    async function handleApprove() {
-      if (!workflowId) return;
-
-      try {
-        const result = await window.api.approveWorkflow(workflowId);
-        console.log('Approval result:', result);
-
-        // Update UI to show deploying
-        const actionBar = document.querySelector('.action-bar');
-        if (actionBar) {
-          actionBar.innerHTML = `
-            <div style="display: flex; align-items: center; gap: 12px; color: #10b981;">
-              <div class="spinner" style="width: 24px; height: 24px;"></div>
-              <span>Deploying to production...</span>
-            </div>
-          `;
+    // ======================================================================
+    // Action handlers — Gate 1
+    // ======================================================================
+    function toggleChangeForm() {
+      const form = document.getElementById('changeForm');
+      if (form) {
+        form.classList.toggle('visible');
+        if (form.classList.contains('visible')) {
+          document.getElementById('changeInstruction').focus();
         }
-      } catch (error) {
-        console.error('Approval failed:', error);
-        alert('Approval failed: ' + error.message);
       }
     }
 
-    async function handleReject() {
+    async function handleCodeApprove() {
       if (!workflowId) return;
-
+      setActionBarLoading('Reviewing code — pushing to GitHub...');
       try {
-        const result = await window.api.rejectWorkflow(workflowId, []);
-        console.log('Rejection result:', result);
-
-        // Update UI
-        const actionBar = document.querySelector('.action-bar');
-        if (actionBar) {
-          actionBar.innerHTML = `
-            <div style="display: flex; align-items: center; gap: 12px; color: #f59e0b;">
-              <div class="spinner" style="width: 24px; height: 24px;"></div>
-              <span>Regenerating with auto-fixes...</span>
-            </div>
-          `;
-        }
+        await window.api.codeApproveWorkflow(workflowId);
       } catch (error) {
-        console.error('Rejection failed:', error);
-        alert('Rejection failed: ' + error.message);
+        console.error('Code approval failed:', error);
+        alert('Code approval failed: ' + error.message);
+      }
+    }
+
+    async function handleCodeReject() {
+      if (!workflowId) return;
+      setActionBarLoading('Regenerating with auto-fixes...');
+      try {
+        await window.api.codeRejectWorkflow(workflowId);
+      } catch (error) {
+        console.error('Code rejection failed:', error);
+        alert('Code rejection failed: ' + error.message);
+      }
+    }
+
+    async function handleCodeChangeRequest() {
+      if (!workflowId) return;
+      const instruction = document.getElementById('changeInstruction')?.value?.trim();
+      if (!instruction) {
+        alert('Please describe what changes you want.');
+        return;
+      }
+      setActionBarLoading('Sending change request — regenerating...');
+      try {
+        await window.api.codeChangeRequest(workflowId, instruction);
+      } catch (error) {
+        console.error('Change request failed:', error);
+        alert('Change request failed: ' + error.message);
+      }
+    }
+
+    // ======================================================================
+    // Action handlers — Gate 2
+    // ======================================================================
+    async function handleDeployApprove() {
+      if (!workflowId) return;
+      setActionBarLoading('Deploying to Vercel...');
+      try {
+        await window.api.deployApproveWorkflow(workflowId);
+      } catch (error) {
+        console.error('Deploy approval failed:', error);
+        alert('Deploy approval failed: ' + error.message);
+      }
+    }
+
+    async function handleDeployReject() {
+      if (!workflowId) return;
+      setActionBarLoading('Skipping Vercel deploy...');
+      try {
+        await window.api.deployRejectWorkflow(workflowId);
+      } catch (error) {
+        console.error('Deploy skip failed:', error);
+        alert('Deploy skip failed: ' + error.message);
+      }
+    }
+
+    // ======================================================================
+    // Shared helpers
+    // ======================================================================
+    function setActionBarLoading(message) {
+      const actionBar = document.getElementById('actionBar');
+      if (actionBar) {
+        actionBar.innerHTML = `
+          <div style="display:flex;align-items:center;gap:12px;color:#10b981;">
+            <div class="spinner" style="width:24px;height:24px;"></div>
+            <span>${message}</span>
+          </div>
+        `;
       }
     }
 
@@ -555,7 +785,7 @@
           <div class="placeholder">
             <div class="placeholder-icon">⏳</div>
             <p>Waiting for preview data...</p>
-            <p style="font-size: 12px; color: #6b7280; margin-top: 8px;">Start a Figma workflow to see the preview</p>
+            <p style="font-size:12px;color:#6b7280;margin-top:8px;">Start a Figma workflow to see the preview</p>
           </div>
         `;
       }
