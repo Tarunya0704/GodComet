@@ -2,6 +2,7 @@
 import subprocess
 import json
 import os
+import re
 from typing import Dict, Any, Optional
 import logging
 from pathlib import Path
@@ -173,19 +174,27 @@ class VercelTool:
             )
             
             if result.returncode == 0:
-                # Extract deployment URL from output
+                # Extract deployment URL from output.
+                # Modern Vercel CLI lines look like:
+                #   ✅  Production: https://project-abc123.vercel.app [2s]
+                # Older versions omit the emoji prefix.
+                # Use regex so we're immune to prefix/suffix changes.
                 output_lines = result.stdout.split('\n')
                 deployment_url = None
-                
+
                 for line in output_lines:
-                    if 'https://' in line and 'vercel.app' in line:
-                        # Extract URL
-                        deployment_url = line.strip()
-                        if deployment_url.startswith('Production: '):
-                            deployment_url = deployment_url.replace('Production: ', '')
-                        elif deployment_url.startswith('Preview: '):
-                            deployment_url = deployment_url.replace('Preview: ', '')
+                    match = re.search(r'https://[^\s]+\.vercel\.app[^\s]*', line)
+                    if match:
+                        deployment_url = match.group(0).rstrip('/')
                         break
+
+                # Fallback: grab any https:// URL from the output if no .vercel.app found
+                if not deployment_url:
+                    for line in output_lines:
+                        match = re.search(r'https://[^\s]+', line)
+                        if match:
+                            deployment_url = match.group(0).rstrip('/')
+                            break
                 
                 logger.info(f"✅ Deployed to: {deployment_url}")
                 

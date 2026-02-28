@@ -10,7 +10,12 @@ from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from PIL import Image, ImageChops
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
+try:
+    from skimage.metrics import structural_similarity as ssim
+    import skimage
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    SKIMAGE_AVAILABLE = False
 import io
 from dotenv import load_dotenv
 
@@ -212,6 +217,8 @@ class VisualAuditor:
 
     def _calculate_ssim(self, img1: np.ndarray, img2: np.ndarray) -> float:
         """Calculate Structural Similarity Index (SSIM)"""
+        if not SKIMAGE_AVAILABLE:
+            return {"score": None, "method": "skimage_unavailable"}
         try:
             # Convert to grayscale for SSIM
             from skimage.color import rgb2gray
