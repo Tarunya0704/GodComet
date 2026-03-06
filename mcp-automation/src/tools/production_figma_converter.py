@@ -1146,19 +1146,20 @@ class ImageDownloader:
         self.api_base = "https://api.figma.com/v1"
 
     async def download_images(self, file_id: str, nodes: List[FigmaNode], output_dir: Path) -> Dict[str, str]:
-        """Download all images and return mapping of node_id -> local_path.
+        """Download all image-fill images and return mapping of node_id -> local_path.
 
-        Images are cached on disk by node-ID filename.  On subsequent runs the
-        Figma API is only called for nodes whose file is genuinely missing — this
-        avoids the 403 (expired S3 URL) and 429 (rate limit) errors that occur
-        when the full set is re-requested against a stale Figma file cache.
+        Strategy (two-pass):
+          1. Serve from disk cache (fastest, no API call).
+          2. Fetch missing images via GET /v1/files/{key}/images — one lightweight
+             call that returns hash→S3-URL for every image fill in the file.
+             This endpoint is NOT rate-limited like /v1/images/ (which renders nodes
+             on-demand and exhausts the quota immediately with many images).
+
+        Falls back to the node-render endpoint (/v1/images/) only when the file-images
+        endpoint returns no URL for a node (e.g. the fill references a non-raster asset).
         """
         # Collect all nodes with image fills
-        image_nodes = []
-        for node in nodes:
-            if self._has_image_fill(node):
-                image_nodes.append(node)
-
+        image_nodes = [n for n in nodes if self._has_image_fill(n)]
         if not image_nodes:
             return {}
 
@@ -1168,48 +1169,127 @@ class ImageDownloader:
         # ── Pass 1: serve from disk cache ────────────────────────────────────
         image_map: Dict[str, str] = {}
         missing_nodes: List[FigmaNode] = []
-
         for node in image_nodes:
             safe_id = node.id.replace(':', '_').replace('/', '_')
-            filename = f"{safe_id}.png"
-            filepath = images_dir / filename
+            filepath = images_dir / f"{safe_id}.png"
             if filepath.exists() and filepath.stat().st_size > 0:
-                image_map[node.id] = f"/images/{filename}"
-                logger.debug(f"Cached image: {filename}")
+                image_map[node.id] = f"/images/{safe_id}.png"
+                logger.debug(f"Cached image: {safe_id}.png")
             else:
                 missing_nodes.append(node)
 
+        if image_map:
+            logger.info(
+                f"Cache hit: {len(image_map)}/{len(image_nodes)} images already in public/images/ — skipping API for those"
+            )
         if not missing_nodes:
-            logger.info(f"All {len(image_map)} images served from disk cache — skipping Figma API")
+            logger.info("All images served from disk cache — skipping Figma API entirely")
             return image_map
 
         logger.info(f"{len(image_map)} cached, {len(missing_nodes)} need downloading")
 
-        # ── Pass 2: fetch fresh URLs only for missing files ───────────────────
-        node_ids = [n.id for n in missing_nodes]
-        image_urls = await self._fetch_image_urls(file_id, node_ids)
+        # ── Pass 2: GET /v1/files/{key}/images — hash → S3 URL, one call ─────
+        # Build a hash→node_id index from the image-fill refs stored in Figma data.
+        hash_to_nodes: Dict[str, List[FigmaNode]] = {}
+        for node in missing_nodes:
+            for fill in node.fills:
+                if fill.get("type") == "IMAGE":
+                    ref = fill.get("imageRef", "")
+                    if ref:
+                        hash_to_nodes.setdefault(ref, []).append(node)
 
+        file_image_urls: Dict[str, str] = {}  # hash → download URL
+        if hash_to_nodes:
+            file_image_urls = await self._fetch_file_image_urls(file_id)
+            logger.info(f"File-images endpoint returned {len(file_image_urls)} hash URLs")
+
+        # ── Pass 3: download via hash URLs ────────────────────────────────────
+        still_missing: List[FigmaNode] = []
         async with aiohttp.ClientSession() as session:
             for node in missing_nodes:
                 safe_id = node.id.replace(':', '_').replace('/', '_')
-                filename = f"{safe_id}.png"
-                filepath = images_dir / filename
+                filepath = images_dir / f"{safe_id}.png"
 
-                url = image_urls.get(node.id)
-                if not url:
-                    logger.debug(f"No URL returned by Figma for node {node.id}")
-                    continue
+                # Find the download URL from the hash map
+                dl_url: Optional[str] = None
+                for fill in node.fills:
+                    if fill.get("type") == "IMAGE":
+                        ref = fill.get("imageRef", "")
+                        if ref and ref in file_image_urls:
+                            dl_url = file_image_urls[ref]
+                            break
 
-                await self._download_file(session, url, filepath)
+                if dl_url:
+                    await self._download_file(session, dl_url, filepath)
+                    if filepath.exists() and filepath.stat().st_size > 0:
+                        image_map[node.id] = f"/images/{safe_id}.png"
+                        logger.info(f"Downloaded (hash): {safe_id}.png")
+                        continue
 
-                if filepath.exists() and filepath.stat().st_size > 0:
-                    image_map[node.id] = f"/images/{filename}"
-                    logger.info(f"Downloaded image: {filename}")
-                else:
-                    logger.warning(f"Image download empty/failed for {node.id}")
+                still_missing.append(node)
+
+        # ── Pass 4: fallback — node-render endpoint for anything still missing ─
+        if still_missing:
+            logger.info(
+                f"{len(still_missing)} images not in file-images endpoint"
+                " — falling back to node-render API"
+            )
+            CHUNK = 25
+            render_urls: Dict[str, str] = {}
+            chunks = [still_missing[i:i + CHUNK] for i in range(0, len(still_missing), CHUNK)]
+            for ci, chunk in enumerate(chunks):
+                chunk_ids = [n.id for n in chunk]
+                logger.info(f"Render-fetch chunk {ci + 1}/{len(chunks)} ({len(chunk_ids)} nodes)")
+                render_urls.update(await self._fetch_image_urls(file_id, chunk_ids))
+                if ci < len(chunks) - 1:
+                    await asyncio.sleep(2)
+
+            async with aiohttp.ClientSession() as session:
+                for node in still_missing:
+                    safe_id = node.id.replace(':', '_').replace('/', '_')
+                    filepath = images_dir / f"{safe_id}.png"
+                    url = render_urls.get(node.id)
+                    if not url:
+                        logger.debug(f"No render URL for {node.id}")
+                        continue
+                    await self._download_file(session, url, filepath)
+                    if filepath.exists() and filepath.stat().st_size > 0:
+                        image_map[node.id] = f"/images/{safe_id}.png"
+                        logger.info(f"Downloaded (render): {safe_id}.png")
+                    else:
+                        logger.warning(f"Render download empty/failed for {node.id}")
+
+        for node in image_nodes:
+            if node.id not in image_map:
+                logger.warning(f"Image failed: {node.name} (id={node.id}) — will be skipped in output")
 
         logger.info(f"Image download complete: {len(image_map)}/{len(image_nodes)} images available")
         return image_map
+
+    async def _fetch_file_image_urls(self, file_id: str) -> Dict[str, str]:
+        """GET /v1/files/{key}/images — returns {imageRef_hash: s3_url} for all
+        image fills in the file.  One lightweight call, not rate-limited like the
+        node-render endpoint.  Returns empty dict on any failure.
+        """
+        token = self.figma_token.strip()
+        url = f"{self.api_base}/files/{file_id}/images"
+        loop = asyncio.get_event_loop()
+        try:
+            def _get():
+                return requests.get(
+                    url,
+                    headers={"X-Figma-Token": token},
+                    timeout=30,
+                )
+            resp = await loop.run_in_executor(None, _get)
+            if resp.status_code == 200:
+                return resp.json().get("images") or {}
+            logger.warning(
+                f"File-images endpoint returned {resp.status_code}: {resp.text[:200]}"
+            )
+        except Exception as e:
+            logger.warning(f"File-images fetch failed: {e}")
+        return {}
     
     def _has_image_fill(self, node: FigmaNode) -> bool:
         """Check if node has image fill"""
@@ -1237,10 +1317,13 @@ class ImageDownloader:
             {"Authorization": f"Bearer {token}"},
         ]
 
-        ids_param = ",".join(node_ids[:100])
+        # Caller is responsible for chunking; accept any batch size.
+        ids_param = ",".join(node_ids)
         url = f"{self.api_base}/images/{file_id}"
         params = {"ids": ids_param, "format": "png", "scale": "2"}
 
+        # Escalating waits: 120s → 240s → 480s
+        RATE_LIMIT_WAITS = [120, 240, 480]
         max_retries = 3
         loop = asyncio.get_event_loop()
 
@@ -1248,7 +1331,6 @@ class ImageDownloader:
             for headers in header_variants:
                 header_label = "X-Figma-Token" if "X-Figma-Token" in headers else "Authorization: Bearer"
                 try:
-                    # Run synchronous requests.get in executor to avoid blocking event loop
                     def _do_get():
                         return requests.get(url, headers=headers, params=params, timeout=30)
 
@@ -1265,7 +1347,7 @@ class ImageDownloader:
                         continue  # try next header variant
 
                     if response.status_code == 429:
-                        wait = min(60, 15 * (2 ** attempt))
+                        wait = RATE_LIMIT_WAITS[min(attempt, len(RATE_LIMIT_WAITS) - 1)]
                         logger.warning(
                             f"Image API rate limit (429). "
                             f"Waiting {wait}s (attempt {attempt + 1}/{max_retries})"
@@ -1279,8 +1361,6 @@ class ImageDownloader:
                 except Exception as e:
                     logger.warning(f"Image fetch attempt {attempt + 1} ({header_label}) failed: {e}")
 
-            if attempt < max_retries - 1:
-                await asyncio.sleep(5)
         return {}
     
     async def _download_file(self, session: aiohttp.ClientSession, url: str, filepath: Path):
@@ -1431,6 +1511,7 @@ class ReactCodeGenerator:
         enhance each section separately within token limits (Fix 2 + Fix 3).
         """
         self._infer_top_layout(node)  # detect sidebar+content and switch to flex before JSX gen
+        node._is_root_frame = True    # mark so _generate_jsx can collapse blank top gap
 
         # Generate imports
         imports = ["import React from 'react'"]
@@ -1441,12 +1522,17 @@ class ReactCodeGenerator:
         # ── Fix 2: section-by-section for tall landing-page frames ───────────
         # Criteria: frame is tall (> 1200px), has no auto-layout (absolute coords),
         # and no sidebar was detected (not a dashboard).
+        # Match convert()'s landing-page criterion exactly (height > width * 1.5)
+        # so section-split and AI-full-generation always agree on which frames are pages.
+        # Also filter section children to only those large enough to be real sections
+        # (height > 100px) so decorative nodes don't inflate the section count.
         is_tall_page = (
             node.height > 1200
+            and node.height > (node.width or 1) * 1.5
             and not node.has_auto_layout
             and not getattr(node, '_infer_hscreen', False)
         )
-        visible_children = [c for c in node.children if c.visible]
+        visible_children = [c for c in node.children if c.visible and c.height > 100]
 
         if is_tall_page and len(visible_children) >= 2:
             section_consts = []
@@ -1456,9 +1542,17 @@ class ReactCodeGenerator:
                 section_names.append(sec_name)
                 # Each child generated with parent=None so no parent-relative absolute coords
                 jsx = self._generate_jsx(child, image_map, indent=2, parent=None)
+                # Replace h-screen in the section's root opening tag only so the
+                # section doesn't claim the full viewport height inside a scroll container.
+                first_tag_end = jsx.find('>')
+                if first_tag_end != -1:
+                    jsx = jsx[:first_tag_end].replace('h-screen', 'min-h-0') + jsx[first_tag_end:]
                 section_consts.append(f"const {sec_name} = () => (\n{jsx}\n)")
 
-            renders = "\n      ".join(f"<{n} />" for n in section_names)
+            renders = "\n      ".join(
+                f'<div className="relative w-full overflow-hidden">\n        <{n} />\n      </div>'
+                for n in section_names
+            )
             sections_str = "\n\n".join(section_consts)
 
             logger.info(
@@ -1471,7 +1565,7 @@ class ReactCodeGenerator:
 
 export default function {component_name}() {{
   return (
-    <div className="w-full">
+    <div className="w-full flex flex-col isolate">
       {renders}
     </div>
   )
@@ -1545,6 +1639,20 @@ export default function {component_name}() {{
             node_y = node.absolute_bounds.get("y", 0)
             rel_x = int(node_x - parent_x)
             rel_y = int(node_y - parent_y)
+
+            # Collapse blank top gap: when the parent is the root frame, shift all
+            # children up by the y-offset of the topmost visible child so the first
+            # element starts at top-0 instead of top-[largeOffset]px.
+            if getattr(parent, '_is_root_frame', False):
+                sibling_ys = [
+                    c.absolute_bounds.get("y", 0)
+                    for c in parent.children
+                    if getattr(c, 'visible', True) and c.absolute_bounds
+                ]
+                if sibling_ys:
+                    top_gap = int(min(sibling_ys) - parent_y)
+                    rel_y = max(0, rel_y - top_gap)
+
             classes.append("absolute")
             classes.append(f"left-[{rel_x}px]" if rel_x != 0 else "left-0")
             classes.append(f"top-[{rel_y}px]" if rel_y != 0 else "top-0")
@@ -1559,38 +1667,48 @@ export default function {component_name}() {{
         # These flags are set in-memory and override whatever the standard
         # Tailwind converters produced, without touching any Figma data.
         if getattr(node, '_infer_hscreen', False):
-            # Root flex container: replace any fixed/relative height with h-screen
+            # Sidebar layout root: full viewport, no scroll (dashboard).
+            # w-screen clips any child that bleeds past the viewport edge.
             classes = [c for c in classes if not (c.startswith('h-[') or c == 'h-full')]
-            classes.extend(['h-screen', 'overflow-hidden'])
+            classes = [c for c in classes if not (c.startswith('w-[') or c == 'w-full')]
+            classes.extend(['w-screen', 'h-screen', 'overflow-hidden'])
 
         if getattr(node, '_infer_shrink_0', False):
-            classes.append('flex-shrink-0')
+            # Sidebar: full viewport height, sticks to top, scrolls its own content.
+            # flex-shrink-0 keeps it at the fixed Figma width regardless of content.
+            classes = [c for c in classes if not (c.startswith('h-[') or c == 'h-full')]
+            classes.extend(['h-screen', 'sticky', 'top-0', 'overflow-y-auto', 'flex-shrink-0'])
 
         if getattr(node, '_infer_flex_one', False):
-            # Content panel fills remaining width — flex-1 beats w-full in a flex row
+            # Content panel: own vertical scroll context, fills remaining width after sidebar.
             classes = [c for c in classes if not (c.startswith('w-[') or c == 'w-full')]
-            classes.extend(['flex-1', 'min-w-0'])
+            classes = [c for c in classes if not (c.startswith('h-[') or c == 'h-full')]
+            classes.extend(['h-screen', 'overflow-y-auto', 'flex-1', 'min-w-0'])
 
-        # Fix 1: root container (parent is None) must never block page scroll.
-        # Replace overflow-hidden with overflow-y-auto so a landing page can scroll.
-        # Dashboards: their root is h-screen so no overflow actually occurs anyway.
-        if parent is None and 'overflow-hidden' in classes:
-            classes = [c if c != 'overflow-hidden' else 'overflow-y-auto' for c in classes]
+        # Root container overflow handling (parent is None = outermost div).
+        if parent is None:
+            if getattr(node, '_infer_hscreen', False):
+                # Sidebar layout: overflow-hidden already added above — leave it.
+                # Ensure w-screen didn't get removed by an earlier class pass.
+                if 'w-screen' not in classes:
+                    classes.append('w-screen')
+            else:
+                # Landing page / section-split: allow vertical scroll, block horizontal.
+                classes = [c for c in classes if c != 'overflow-hidden']
+                if 'w-full' not in classes:
+                    classes.append('w-full')
+                if 'overflow-x-hidden' not in classes:
+                    classes.append('overflow-x-hidden')
 
         # Build className string
         class_str = " ".join(classes)
 
         # Opening tag
         if element == "img":
-            # Next.js Image component — skip if no valid src (empty src crashes build)
+            # Next.js Image component — skip entirely if no valid src (empty src crashes build)
             img_src = image_map.get(node.id, "")
             if not img_src:
-                # Grey placeholder — preserves card structure and keeps white text
-                # readable while the actual image is unavailable (e.g. 403 from Figma).
-                # bg-gray-300 is a generic convention, not design-specific.
-                placeholder_cls = (f"{class_str} bg-gray-300 animate-pulse").strip()
-                lines.append(f'{ind}<div className="{placeholder_cls}" />')
-                return "\n".join(lines)
+                return ""
             lines.append(f'{ind}<Image')
             lines.append(f'{ind}  src="{img_src}"')
             lines.append(f'{ind}  alt="{node.name}"')
@@ -1667,19 +1785,49 @@ class AICodeGenerator:
 
     def __init__(self):
         self.groq_client = None
+        self.openai_client = None
         self.model = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+        # OpenAI (primary — higher quality, larger context)
+        try:
+            from openai import OpenAI
+            api_key = os.getenv("OPENAI_API_KEY")
+            if api_key:
+                self.openai_client = OpenAI(api_key=api_key)
+                logger.info("AI Code Generator: OpenAI gpt-4o enabled (primary)")
+        except ImportError:
+            logger.warning("AI Code Generator: openai package not installed")
+
+        # Groq (fallback — fast, free)
         try:
             from groq import Groq
             api_key = os.getenv("GROQ_API_KEY")
             if api_key:
                 self.groq_client = Groq(api_key=api_key)
-                logger.info("AI Code Generator: Groq vision enabled")
+                logger.info(
+                    "AI Code Generator: Groq vision enabled"
+                    + (" (fallback)" if self.openai_client else " (primary)")
+                )
         except ImportError:
             logger.warning("AI Code Generator: groq package not installed")
 
     @property
     def available(self):
-        return self.groq_client is not None
+        return self.openai_client is not None or self.groq_client is not None
+
+    def _call_openai(self, messages: List[Dict]) -> Optional[str]:
+        """Call OpenAI gpt-4o with the given messages. Returns raw text or None."""
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=4096,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"OpenAI call failed: {e}")
+            return None
 
     def generate_component(
         self,
@@ -1690,7 +1838,7 @@ class AICodeGenerator:
         layout_type: str = "dashboard",
     ) -> Optional[str]:
         """Generate component code using AI vision model"""
-        if not self.groq_client:
+        if not self.openai_client and not self.groq_client:
             return None
 
         try:
@@ -1737,14 +1885,19 @@ class AICodeGenerator:
                 messages.append({"role": "user", "content": prompt})
 
             logger.info(f"AI generating component: {component_name}")
-            response = self.groq_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=16000
-            )
-
-            code = response.choices[0].message.content
+            if self.openai_client:
+                logger.info(f"  using OpenAI gpt-4o")
+                code = self._call_openai(messages)
+                if code is None and self.groq_client:
+                    logger.warning("OpenAI failed — falling back to Groq")
+                    code = self.groq_client.chat.completions.create(
+                        model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                    ).choices[0].message.content
+            else:
+                logger.info(f"  using Groq {self.model}")
+                code = self.groq_client.chat.completions.create(
+                    model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                ).choices[0].message.content
 
             # Extract code from markdown code blocks
             if "```" in code:
@@ -1910,7 +2063,7 @@ class AICodeGenerator:
         see in the screenshot that the programmatic pass cannot produce:
         gradient backgrounds, complex shadows, missing effects, border subtleties.
         """
-        if not self.groq_client:
+        if not self.openai_client and not self.groq_client:
             return None
 
         # Fix 3: for large sectioned components, enhance section-by-section so
@@ -1990,14 +2143,21 @@ class AICodeGenerator:
                 messages.append({"role": "user", "content": enhance_prompt})
 
             logger.info(f"🎨 [AI ENHANCE] Enhancing {component_name} visual details")
-            response = self.groq_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=8192,
-            )
-
-            enhanced = response.choices[0].message.content
+            if self.openai_client:
+                logger.info("  using OpenAI gpt-4o")
+                enhanced = self._call_openai(messages)
+                if enhanced is None and self.groq_client:
+                    logger.warning("OpenAI failed — falling back to Groq")
+                    enhanced = self.groq_client.chat.completions.create(
+                        model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                    ).choices[0].message.content
+                if enhanced is None:
+                    return None
+            else:
+                logger.info(f"  using Groq {self.model}")
+                enhanced = self.groq_client.chat.completions.create(
+                    model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                ).choices[0].message.content
 
             # Strip markdown fences if present
             if "```" in enhanced:
@@ -2385,6 +2545,16 @@ class ProductionFigmaToCode:
         self.code_generator = ReactCodeGenerator()
         self.ai_generator = AICodeGenerator()
         self.image_downloader = ImageDownloader(figma_token)
+
+        # MCP client for exact Figma Variables (design tokens with real names).
+        # Degrades gracefully if npx / figma-developer-mcp is unavailable.
+        try:
+            from tools.figma_mcp_client import FigmaMCPClient
+            self.mcp_client: Optional[FigmaMCPClient] = FigmaMCPClient(figma_token)
+            logger.info("✅ Figma MCP client ready")
+        except Exception as _e:
+            logger.warning(f"MCP client unavailable — design tokens from AST only: {_e}")
+            self.mcp_client = None
     
     async def _export_frame_image(self, file_id: str, node_id: str, output_dir: Path) -> Optional[str]:
         """Export a specific Figma frame as PNG using the images API.
@@ -2440,8 +2610,9 @@ class ProductionFigmaToCode:
     async def convert(self, figma_url: str, output_dir: Path, figma_screenshot_path: str = None) -> Dict:
         """Convert Figma to production-ready code"""
         try:
-            file_id = self._extract_file_id(figma_url)
-            logger.info(f"🎨 Converting Figma file: {file_id}")
+            file_id, target_node_id = self._extract_file_id(figma_url)
+            self._target_node_id = target_node_id
+            logger.info(f"🎨 Converting Figma file: {file_id}" + (f" (node: {target_node_id})" if target_node_id else ""))
             
             # Fetch Figma file — run in executor so time.sleep inside _fetch_file
             # doesn't block the asyncio event loop during rate-limit waits.
@@ -2473,7 +2644,32 @@ class ProductionFigmaToCode:
             self.token_extractor.extract(root)
             self.token_extractor.write_tokens_file(output_dir)
             logger.info("✅ Design tokens extracted → src/tokens.ts")
-            
+
+            # ── MCP: fetch Figma Variables for exact design token names ───────────
+            # Uses figma-developer-mcp via stdio. Falls back silently if unavailable.
+            mcp_colors: Dict[str, str] = {}
+            if self.mcp_client:
+                try:
+                    mcp_vars = await self.mcp_client.get_local_variables(file_id)
+                    for var_name, hex_val in mcp_vars.get("colors", {}).items():
+                        # Normalise path-based names: "Colors/Primary/500" → "primary-500"
+                        parts = var_name.lower().split("/")
+                        if parts and parts[0] in ("colors", "color"):
+                            parts = parts[1:]
+                        key = "-".join(p.strip() for p in parts if p.strip())
+                        if key:
+                            mcp_colors[key] = hex_val
+                    if mcp_colors:
+                        logger.info(f"✅ MCP Variables: {len(mcp_colors)} exact color tokens")
+                    else:
+                        logger.info("ℹ️ MCP: file has no Figma Variables — using AST tokens")
+                except Exception as _e:
+                    logger.warning(f"MCP variable fetch failed ({_e}) — using AST tokens only")
+
+            # Merge: AST-extracted colors as base, Figma Variables override/extend
+            _ast_colors: Dict[str, str] = self.token_extractor.build_tokens().get("colors", {})
+            _merged_colors: Dict[str, str] = {**_ast_colors, **mcp_colors}
+
             # Get all frames (screens)
             frames = self._get_frames(root)
             logger.info(f"✅ Found {len(frames)} screens")
@@ -2592,7 +2788,7 @@ class ProductionFigmaToCode:
                         # Dashboard: enhance visual details only — structure from static code stays intact
                         enhanced = self.ai_generator.enhance_component(
                             code, comp_name, _ai_screenshot_path,
-                            token_colors=self.token_extractor.build_tokens().get("colors", {}),
+                            token_colors=_merged_colors,
                         )
                         if enhanced:
                             code = enhanced
@@ -2616,10 +2812,7 @@ class ProductionFigmaToCode:
             # Generate supporting files (complete Next.js App Router structure)
             self._generate_nextjs_structure(output_dir, generated)
             self._generate_package_json(output_dir)
-            self._generate_tailwind_config(
-                output_dir,
-                self.token_extractor.build_tokens().get("colors", {}),
-            )
+            self._generate_tailwind_config(output_dir, _merged_colors)
             self._generate_postcss_config(output_dir)
             self._generate_next_config(output_dir)
             self._generate_tsconfig(output_dir)
@@ -2736,28 +2929,103 @@ class ProductionFigmaToCode:
         raise Exception("Max retries exceeded")
     
     def _get_frames(self, root: FigmaNode) -> List[FigmaNode]:
-        """Get all top-level frames"""
-        frames = []
-        
-        # Look in all pages
+        """Return the frames to convert.
+
+        Normally returns every top-level FRAME across all pages.
+        When self._target_node_id is set (from a ?node-id= URL param), searches
+        the full document tree for that node and narrows the result:
+          - FRAME node  → [node]
+          - GROUP/SECTION → direct FRAME children of that node
+        Falls back to all frames if the node is not found or is too small (< 300px).
+        """
+        # Collect all top-level frames (baseline result)
+        frames: List[FigmaNode] = []
         for page in root.children:
             for child in page.children:
                 if child.type == "FRAME" and child.visible:
                     frames.append(child)
-        
+
+        logger.info(
+            f"[_get_frames] Found {len(frames)} top-level frames:\n"
+            + "\n".join(
+                f"  [{i}] id={f.id!r:20s} {int(f.width):5d}x{int(f.height):<5d}  name={f.name!r}"
+                for i, f in enumerate(frames)
+            )
+        )
+
+        target_id: Optional[str] = getattr(self, '_target_node_id', None)
+        if not target_id:
+            return frames
+
+        # Search full tree for the target node
+        def _find(node: FigmaNode, wanted: str) -> Optional[FigmaNode]:
+            if node.id == wanted:
+                return node
+            for child in node.children:
+                found = _find(child, wanted)
+                if found:
+                    return found
+            return None
+
+        target = _find(root, target_id)
+
+        if target is None:
+            logger.warning(f"node-id {target_id!r} not found in document — returning all frames")
+            return frames
+
+        if target.width <= 300 or target.height <= 300:
+            logger.warning(
+                f"node-id {target_id!r} ({target.name}) is {int(target.width)}×{int(target.height)}px"
+                " — too small to use as a frame target, returning all frames"
+            )
+            return frames
+
+        if target.type == "FRAME":
+            logger.info(
+                f"Targeting node {target_id!r} ({target.name} "
+                f"{int(target.width)}×{int(target.height)})"
+            )
+            return [target]
+
+        if target.type in ("GROUP", "SECTION"):
+            children = [c for c in target.children if c.type == "FRAME" and c.visible]
+            if children:
+                logger.info(
+                    f"Targeting node {target_id!r} ({target.name} "
+                    f"{int(target.width)}×{int(target.height)}) — "
+                    f"using {len(children)} FRAME children"
+                )
+                return children
+
+        logger.warning(
+            f"node-id {target_id!r} ({target.name}, type={target.type}) yielded no usable frames"
+            " — returning all frames"
+        )
         return frames
     
-    def _extract_file_id(self, url: str) -> str:
-        """Extract file ID from Figma URL"""
-        patterns = [
-            r'/design/([a-zA-Z0-9]+)',
-            r'/file/([a-zA-Z0-9]+)',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        raise Exception("Invalid Figma URL")
+    def _extract_file_id(self, url: str) -> Tuple[str, Optional[str]]:
+        """Extract (file_id, node_id) from a Figma URL.
+
+        node_id is parsed from ?node-id=X-Y or ?node-id=X%3AY (URL-encoded colon).
+        Returns (file_id, None) when no node-id query param is present.
+        """
+        file_id: Optional[str] = None
+        for pattern in (r'/design/([a-zA-Z0-9]+)', r'/file/([a-zA-Z0-9]+)'):
+            m = re.search(pattern, url)
+            if m:
+                file_id = m.group(1)
+                break
+        if not file_id:
+            raise Exception("Invalid Figma URL")
+
+        node_id: Optional[str] = None
+        nid_match = re.search(r'[?&]node-id=([^&]+)', url)
+        if nid_match:
+            raw = nid_match.group(1)
+            # X%3AY → X:Y  (URL-encoded colon);  X-Y stays as X:Y (Figma dash form)
+            node_id = raw.replace('%3A', ':').replace('-', ':')
+
+        return file_id, node_id
     
     def _sanitize_name(self, name: str) -> str:
         """Convert to valid component name"""

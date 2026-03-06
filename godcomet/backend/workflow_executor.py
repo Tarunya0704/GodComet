@@ -291,11 +291,7 @@ class WorkflowExecutor:
         )
 
         try:
-            # Import the production converter
-            from tools.production_figma_converter import ProductionFigmaToCode
-
             figma_token = os.getenv("FIGMA_TOKEN")
-            converter = ProductionFigmaToCode(figma_token)
 
             # Create output directory
             projects_dir = Path(__file__).parent.parent.parent / "mcp-automation" / "projects"
@@ -316,12 +312,34 @@ class WorkflowExecutor:
             screenshot_dir = Path(__file__).parent.parent.parent / "mcp-automation" / "screenshots" / workflow.id
             figma_screenshot = str(screenshot_dir / "figma_original.png") if screenshot_dir.exists() else None
 
-            # Generate code (AI-powered with Figma screenshot for better accuracy)
-            result = await converter.convert(
-                figma_url=workflow.figma_url,
-                output_dir=output_dir,
-                figma_screenshot_path=figma_screenshot
-            )
+            # Try MCP converter first (uses Figma MCP for richer design data),
+            # fall back to REST API converter if MCP is unavailable or fails.
+            use_mcp = os.getenv("USE_MCP", "true").lower() == "true"
+
+            if use_mcp:
+                try:
+                    from tools.mcp_figma_converter import MCPFigmaConverter
+                    converter = MCPFigmaConverter(figma_token)
+                    logger.info("Using Figma MCP converter (higher quality)")
+                    result = await converter.convert(
+                        figma_url=workflow.figma_url,
+                        output_dir=output_dir,
+                    )
+                    if not result.get("success"):
+                        raise Exception(result.get("error", "MCP conversion failed"))
+                except Exception as _mcp_err:
+                    logger.warning(f"MCP converter failed: {_mcp_err} — falling back to REST API")
+                    use_mcp = False
+
+            if not use_mcp:
+                from tools.production_figma_converter import ProductionFigmaToCode
+                converter = ProductionFigmaToCode(figma_token)
+                logger.info("Using REST API converter (fallback)")
+                result = await converter.convert(
+                    figma_url=workflow.figma_url,
+                    output_dir=output_dir,
+                    figma_screenshot_path=figma_screenshot,
+                )
 
             # Surface code generation failures immediately
             if not result.get("success"):
@@ -674,6 +692,11 @@ class WorkflowExecutor:
 
         try:
             from tools.github_tool import GitHubTool
+            from dotenv import load_dotenv
+
+            # Re-load .env in case os.environ was not populated at import time
+            _env_path = Path(__file__).parent.parent.parent / "mcp-automation" / ".env"
+            load_dotenv(dotenv_path=_env_path, override=False)
 
             github_token = os.getenv("GITHUB_TOKEN")
             if not github_token:
