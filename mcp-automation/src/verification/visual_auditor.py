@@ -54,10 +54,10 @@ class VisualAuditor:
         threshold: float = 0.95,
         use_groq: bool = True,
         use_openai: bool = False,
-        use_anthropic: bool = False,
+        use_anthropic: bool = True,
         groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
-        openai_model: str = "gpt-4o-mini",
-        anthropic_model: str = "claude-3-5-sonnet-20241022"
+        openai_model: str = "gpt-4o",
+        anthropic_model: str = "claude-sonnet-4-20250514"
     ):
         """
         Initialize Visual Auditor with configurable thresholds and models
@@ -204,14 +204,39 @@ class VisualAuditor:
         figma_path: str,
         rendered_path: str
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Load images and ensure they're the same size"""
+        """Load images and ensure they're the same size.
+
+        If aspect ratios differ by more than 10%, the images represent
+        fundamentally different viewports (e.g. thumbnail vs frame render).
+        In that case we resize BOTH to a common target (rendered width) to
+        avoid meaningless SSIM comparisons caused by stretching.
+        """
         figma_img = Image.open(figma_path).convert("RGB")
         rendered_img = Image.open(rendered_path).convert("RGB")
 
-        # Resize rendered to match Figma dimensions
+        fw, fh = figma_img.size
+        rw, rh = rendered_img.size
+
         if figma_img.size != rendered_img.size:
-            print(f"   ⚙️  Resizing: {rendered_img.size} → {figma_img.size}")
-            rendered_img = rendered_img.resize(figma_img.size, Image.Resampling.LANCZOS)
+            figma_ar = fw / fh if fh else 1.0
+            rendered_ar = rw / rh if rh else 1.0
+            ar_diff = abs(figma_ar - rendered_ar) / max(figma_ar, rendered_ar)
+
+            if ar_diff > 0.10:
+                # Aspect ratios too different — resize both to rendered width to
+                # preserve the rendered layout (it's the ground truth at its own AR)
+                target_w = rw
+                target_h = rh
+                print(
+                    f"   ⚠️  Aspect ratio mismatch ({fw}×{fh} AR={figma_ar:.2f} vs "
+                    f"{rw}×{rh} AR={rendered_ar:.2f}, diff={ar_diff*100:.0f}%). "
+                    f"Resizing both to {target_w}×{target_h} (rendered dimensions)."
+                )
+                figma_img = figma_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                # rendered_img is already the right size
+            else:
+                print(f"   ⚙️  Resizing rendered: {rw}×{rh} → {fw}×{fh}")
+                rendered_img = rendered_img.resize((fw, fh), Image.Resampling.LANCZOS)
 
         return np.array(figma_img), np.array(rendered_img)
 
@@ -255,17 +280,17 @@ class VisualAuditor:
     ) -> Dict:
         """Use Vision LLM to analyze semantic differences"""
 
-        # Try Groq first (FREE and FAST!)
-        if self.groq_client:
+        # Claude primary (best vision quality)
+        if self.anthropic_client:
+            return self._anthropic_vision_analysis(figma_path, rendered_path, figma_metadata)
+
+        # Fallback to Groq
+        elif self.groq_client:
             return self._groq_vision_analysis(figma_path, rendered_path, figma_metadata)
 
         # Fallback to OpenAI
         elif self.openai_client:
             return self._openai_vision_analysis(figma_path, rendered_path, figma_metadata)
-
-        # Fallback to Anthropic
-        elif self.anthropic_client:
-            return self._anthropic_vision_analysis(figma_path, rendered_path, figma_metadata)
 
         # No vision models available
         else:
@@ -434,72 +459,41 @@ class VisualAuditor:
             return self._parse_vision_response(content)
 
         except Exception as e:
-            print(f"   ⚠️  Claude vision analysis failed: {e}")
+            print(f"   ⚠️  Claude vision analysis failed: {e} — falling back to Groq")
+            if self.groq_client:
+                return self._groq_vision_analysis(figma_path, rendered_path, figma_metadata)
             return {"score": 0.0, "issues": [], "error": str(e)}
 
-    def _encode_image(self, image_path: str) -> str:
-        """Encode image to base64 string"""
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
+    def _encode_image(self, image_path: str, max_width: int = 1024) -> str:
+        """Load image, resize to max_width preserving aspect ratio, return base64 PNG.
+
+        Keeping audit images at ≤1024px wide avoids unnecessary token spend
+        while preserving enough detail for colour/spacing comparison.
+        """
+        img = Image.open(image_path).convert("RGB")
+        if img.width > max_width:
+            ratio = max_width / img.width
+            img = img.resize((max_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
 
     def _build_vision_prompt(self, figma_metadata: Optional[Dict]) -> str:
         """Build the prompt for vision model analysis"""
-        base_prompt = """You are a UI/UX expert comparing two designs:
-1. **Original Figma Design** (reference/expected)
-2. **Generated Website** (candidate/actual)
+        return """Compare these two UI screenshots. Rate visual similarity 0-100.
 
-Analyze these images and identify ALL differences:
+Scoring guide:
+90-100: Nearly identical layout, colors, and content
+80-89: Same layout structure, minor spacing/color differences
+70-79: Recognizably the same design, some elements differ in size or position
+60-69: Similar structure but noticeable differences in layout or content
+50-59: Same general concept but significant layout differences
+Below 50: Very different designs
 
-**Critical Issues** (must fix):
-- Layout differences (alignment, spacing, positioning)
-- Color mismatches (even slight variations)
-- Typography errors (font family, size, weight, line-height)
-- Missing elements or extra elements
-- Border/shadow differences
-- Image/icon discrepancies
+Focus on: presence of all UI elements (sidebar, cards, buttons, text), correct layout structure (sidebar left, content right, grid of cards), correct colors and images. Do NOT heavily penalize minor spacing differences or font rendering differences.
 
-**Minor Issues** (nice to fix):
-- Subtle spacing variations (<5px)
-- Anti-aliasing differences
-- Minor color shades (#3B82F6 vs #3B82F7)
-
-Return your analysis as JSON:
-```json
-{
-  "layout_score": 0.95,
-  "color_score": 0.98,
-  "typography_score": 0.96,
-  "overall_score": 0.96,
-  "critical_issues": [
-    {
-      "type": "color_mismatch",
-      "element": "primary button",
-      "expected": "#3B82F6",
-      "actual": "#60A5FA",
-      "severity": "critical",
-      "fix": "Change button background to #3B82F6"
-    }
-  ],
-  "minor_issues": [
-    {
-      "type": "spacing",
-      "element": "header padding",
-      "expected": "24px",
-      "actual": "20px",
-      "severity": "minor"
-    }
-  ]
-}
-```
-
-**Original Figma Design (Reference):**
-"""
-
-        # Add figma metadata if available
-        if figma_metadata:
-            base_prompt += f"\n\nDesign Context:\n{json.dumps(figma_metadata, indent=2)}\n"
-
-        return base_prompt
+Return ONLY a JSON object: {"score": NUMBER, "issues": ["issue1", "issue2"]}"""
 
     def _parse_vision_response(self, content: str) -> Dict:
         """Parse the vision model's JSON response"""
@@ -514,11 +508,20 @@ Return your analysis as JSON:
 
             data = json.loads(json_str)
 
-            # Combine critical and minor issues
-            issues = data.get("critical_issues", []) + data.get("minor_issues", [])
+            # Support both new format {"score": N, "issues": [...]}
+            # and old format {"overall_score": N, "critical_issues": [...]}
+            raw_score = data.get("score", data.get("overall_score", 0.0))
+            # New prompt returns 0-100; old prompt returned 0.0-1.0 — normalise
+            score = raw_score / 100.0 if raw_score > 1.0 else raw_score
+
+            issues = (
+                data.get("issues", [])
+                + data.get("critical_issues", [])
+                + data.get("minor_issues", [])
+            )
 
             return {
-                "score": data.get("overall_score", 0.0),
+                "score": score,
                 "layout_score": data.get("layout_score", 0.0),
                 "color_score": data.get("color_score", 0.0),
                 "typography_score": data.get("typography_score", 0.0),

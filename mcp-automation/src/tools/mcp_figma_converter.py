@@ -56,20 +56,27 @@ class MCPFigmaConverter(ProductionFigmaToCode):
     """
 
     def __init__(self, figma_token: str):
-        # Parent __init__ builds all sub-generators and also tries to create
-        # self.mcp_client — we unconditionally rebuild it here so this class
-        # always has a fresh FigmaMCPClient (even if the parent silently failed).
+        # Parent __init__ builds all sub-generators and creates self.mcp_client.
+        # Reuse it — do NOT create a second FigmaMCPClient here.
+        # Creating two clients races over port 3333: both call _port_in_use()
+        # before the first process binds, so both try to spawn → EADDRINUSE →
+        # the second crashes, then __del__ kills the first → no server running.
         super().__init__(figma_token)
 
-        try:
-            self.mcp_client = FigmaMCPClient(figma_token)
-            logger.info("✅ MCPFigmaConverter: MCP client ready")
-        except Exception as _e:
-            logger.warning(
-                f"MCPFigmaConverter: MCP client unavailable ({_e}). "
-                "Will fall back to REST API on every convert() call."
-            )
-            self.mcp_client = None
+        if self.mcp_client is not None:
+            logger.info("✅ MCPFigmaConverter: reusing MCP client from parent (port %d)", self.mcp_client._port)
+        else:
+            # Parent failed to create a client (Node.js missing, bad token, etc.)
+            # Try once more — by now __init__ is done so there's no race.
+            try:
+                self.mcp_client = FigmaMCPClient(figma_token)
+                logger.info("✅ MCPFigmaConverter: MCP client ready (fallback init)")
+            except Exception as _e:
+                logger.warning(
+                    f"MCPFigmaConverter: MCP client unavailable ({_e}). "
+                    "Will fall back to REST API on every convert() call."
+                )
+                self.mcp_client = None
 
     # ── MCP node → FigmaNode ──────────────────────────────────────────────────
 
@@ -426,13 +433,16 @@ class MCPFigmaConverter(ProductionFigmaToCode):
 
         logger.info("🎉 [MCP] Conversion complete!")
 
+        first_frame = frames[0] if frames else None
         return {
             "success": True,
             "components": generated,
             "images": len(image_map),
             "output_dir": str(output_dir),
             "file_name": figma_data.get("name", "Untitled"),
-            "first_frame_node_id": frames[0].id if frames else None,
+            "first_frame_node_id": first_frame.id if first_frame else None,
+            "frame_width": int(first_frame.width) if first_frame else None,
+            "frame_height": int(first_frame.height) if first_frame else None,
             "thumbnail_url": figma_data.get("thumbnailUrl"),
             "registry_path": str(registry_path),
         }

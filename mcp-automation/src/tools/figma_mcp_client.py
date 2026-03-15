@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT       = 3333
 HEALTH_POLL_SEC    = 0.5
-HEALTH_TIMEOUT_SEC = 10        # max wait for server to become ready
+HEALTH_TIMEOUT_SEC = 30        # max wait for server to become ready (Windows is slow)
 TOOL_TIMEOUT_SEC   = 30        # per-tool-call HTTP timeout
 
 
@@ -100,6 +100,8 @@ class FigmaMCPClient:
         # StreamableHTTP MCP endpoint (server logs: "StreamableHTTP endpoint available at .../mcp")
         self._mcp_url     = f"http://127.0.0.1:{self._port}/mcp"
 
+        self._owned = False  # True only if THIS client spawned the process
+
         if _port_in_use(self._port):
             # An MCP server is already listening — reuse it, skip Popen
             logger.info(
@@ -110,6 +112,7 @@ class FigmaMCPClient:
         else:
             _npx()  # raise early if Node.js missing
             self._start_server()
+            self._owned = True
 
     # ── Server lifecycle ──────────────────────────────────────────────────────
 
@@ -195,7 +198,16 @@ class FigmaMCPClient:
         )
 
     def stop(self) -> None:
-        """Terminate the background MCP server process."""
+        """Terminate the background MCP server process.
+
+        Only terminates if this client instance actually spawned the process
+        (_owned=True).  Clients that reused an existing server on the port
+        will not kill it.
+        """
+        if not self._owned:
+            # This client attached to an already-running server — don't kill it
+            self._ready = False
+            return
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             try:

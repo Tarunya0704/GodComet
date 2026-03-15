@@ -10,7 +10,10 @@ load_dotenv(dotenv_path=env_path)
 class Config:
     """Configuration settings"""
     
-    # Groq AI
+    # Anthropic (primary AI model)
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+    # Groq AI (fallback)
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     
     # AWS (optional)

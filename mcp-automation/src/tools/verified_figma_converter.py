@@ -329,13 +329,29 @@ class VerifiedFigmaConverter:
 
         print(f"   📸 Screenshot saved: {screenshot_path}")
 
+        # Extract frame dimensions for correct viewport matching
+        frame_width, frame_height = 1920, 1080  # sensible defaults
+        try:
+            page_node = figma_data["document"]["children"][0]
+            for child in page_node.get("children", []):
+                bbox = child.get("absoluteBoundingBox", {})
+                if bbox.get("width") and bbox.get("height"):
+                    frame_width = int(bbox["width"])
+                    frame_height = int(bbox["height"])
+                    break
+        except Exception:
+            pass
+        print(f"   📐 Frame dimensions: {frame_width}×{frame_height}px")
+
         return {
             "screenshot_path": str(screenshot_path),
             "metadata": {
                 "file_id": file_id,
                 "node_id": node_id,
                 "figma_url": figma_url,
-                "design_data": figma_data
+                "design_data": figma_data,
+                "frame_width": frame_width,
+                "frame_height": frame_height,
             },
             "prompt": f"Generate a React/Next.js website from Figma design: {figma_url}"
         }
@@ -390,8 +406,13 @@ class VerifiedFigmaConverter:
         previous_score = 0.0
         self.self_healer.reset_iteration_count()
 
+        # Use Figma frame dimensions for the render viewport so pixel comparisons are meaningful
+        frame_width = figma_metadata.get("frame_width", 1920)
+        frame_height = figma_metadata.get("frame_height", 1080)
+        print(f"   📐 Render viewport: {frame_width}×{frame_height}px (matching Figma frame)")
+
         for iteration in range(1, self.max_iterations + 1):
-            print(f"\n🔄 ITERATION {iteration}/{self.max_iterations}")
+            print(f"\n🔄 HEALING LOOP: iteration {iteration}/{self.max_iterations}")
             print("-" * 80)
 
             # Step 3: Render Generated Code
@@ -400,6 +421,8 @@ class VerifiedFigmaConverter:
 
             render_result = await self.render_engine.render(
                 project_path,
+                viewport_width=frame_width,
+                viewport_height=frame_height,
                 output_path=f"screenshots/{self.session_id}/rendered_iter{iteration}.png"
             )
 
@@ -422,6 +445,8 @@ class VerifiedFigmaConverter:
             audit_duration = time.time() - audit_start
 
             print(f"   📊 Score: {current_score:.1%} (threshold: {self.threshold:.0%})")
+            print(f"   📸 Figma screenshot: {'EXISTS' if Path(figma_screenshot_path).exists() else 'MISSING'} — {figma_screenshot_path}")
+            print(f"   📸 Rendered screenshot: {'EXISTS' if Path(rendered_screenshot).exists() else 'MISSING'} — {rendered_screenshot}")
             print(f"   ✅ Audit completed in {audit_duration:.1f}s")
 
             # Track iteration
@@ -562,20 +587,32 @@ class VerifiedFigmaConverter:
         import base64
         import re as _re
 
-        # --- Groq client (same pattern as AICodeGenerator) ---
-        try:
-            from groq import Groq
-        except ImportError:
-            print("   ⚠️  groq package not installed, cannot self-heal")
-            return False
+        # --- Initialize AI clients: OpenAI primary, Groq fallback ---
+        openai_client = None
+        groq_client = None
+        groq_model = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            print("   ⚠️  GROQ_API_KEY not set, cannot self-heal")
-            return False
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            try:
+                from openai import OpenAI
+                openai_client = OpenAI(api_key=openai_key)
+                print("   🤖 Healing using OpenAI gpt-4o (primary)")
+            except ImportError:
+                pass
 
-        groq_client = Groq(api_key=api_key)
-        model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        if not openai_client:
+            try:
+                from groq import Groq
+            except ImportError:
+                print("   ⚠️  Neither openai nor groq packages installed, cannot self-heal")
+                return False
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                print("   ⚠️  No OPENAI_API_KEY or GROQ_API_KEY set, cannot self-heal")
+                return False
+            groq_client = Groq(api_key=api_key)
+            print(f"   🤖 Healing using Groq {groq_model} (fallback)")
 
         # --- Collect current TSX files ---
         project = Path(project_path)
@@ -600,10 +637,21 @@ class VerifiedFigmaConverter:
             print("   ⚠️  No TSX files found in project, cannot self-heal")
             return False
 
-        # --- Encode both screenshots to base64 (same as visual_auditor._encode_image) ---
-        def _encode(path: str) -> str:
-            with open(path, "rb") as fh:
-                return base64.b64encode(fh.read()).decode()
+        # --- Encode both screenshots to base64, resized to ≤1024px wide ---
+        def _encode(path: str, max_width: int = 1024) -> str:
+            try:
+                from PIL import Image
+                import io as _io
+                img = Image.open(path).convert("RGB")
+                if img.width > max_width:
+                    ratio = max_width / img.width
+                    img = img.resize((max_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
+                buf = _io.BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                return base64.b64encode(buf.getvalue()).decode()
+            except Exception:
+                with open(path, "rb") as fh:
+                    return base64.b64encode(fh.read()).decode()
 
         figma_b64 = _encode(figma_screenshot_path)
         rendered_b64 = _encode(rendered_screenshot_path)
@@ -662,22 +710,50 @@ class VerifiedFigmaConverter:
             },
         ]
 
-        # --- Groq vision call (same pattern as AICodeGenerator.generate_component) ---
-        try:
-            response = groq_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_text},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0.1,
-                max_tokens=8000,
-            )
-        except Exception as e:
-            print(f"   ⚠️  Groq healing call failed: {e}")
-            return False
+        # --- Vision call: OpenAI primary, Groq fallback ---
+        raw = None
+        if openai_client:
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": system_text},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.1,
+                    max_tokens=8192,
+                )
+                raw = response.choices[0].message.content
+            except Exception as e:
+                print(f"   ⚠️  OpenAI healing call failed: {e} — trying Groq")
 
-        raw = response.choices[0].message.content
+        if raw is None:
+            if not groq_client:
+                try:
+                    from groq import Groq
+                    gk = os.getenv("GROQ_API_KEY")
+                    if gk:
+                        groq_client = Groq(api_key=gk)
+                except Exception:
+                    pass
+            if groq_client:
+                try:
+                    response = groq_client.chat.completions.create(
+                        model=groq_model,
+                        messages=[
+                            {"role": "system", "content": system_text},
+                            {"role": "user", "content": user_content},
+                        ],
+                        temperature=0.1,
+                        max_tokens=8000,
+                    )
+                    raw = response.choices[0].message.content
+                except Exception as e:
+                    print(f"   ⚠️  Groq healing call failed: {e}")
+
+        if raw is None:
+            print("   ⚠️  All healing AI calls failed")
+            return False
 
         # --- Parse "=== path ===" file blocks from response ---
         parts = _re.split(r'^=== (.+?) ===\s*$', raw, flags=_re.MULTILINE)

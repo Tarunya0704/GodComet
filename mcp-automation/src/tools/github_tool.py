@@ -21,7 +21,7 @@ class GitHubTool:
             logger.error(f"GitHub authentication failed: {e}")
             raise
     
-    async def create_repo(self, repo_name: str, description: str = "", private: bool = False) -> Dict[str, Any]:
+    async def create_repo(self, repo_name: str, description: str = "", private: bool = True) -> Dict[str, Any]:
         """Create a new GitHub repository"""
         try:
             logger.info(f"Creating repository: {repo_name}")

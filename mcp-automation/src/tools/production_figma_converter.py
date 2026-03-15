@@ -5,6 +5,7 @@ UPDATED: Added caching + auto-retry for rate limit handling
 """
 import os
 import json
+import subprocess
 import requests
 import re
 from pathlib import Path
@@ -33,6 +34,7 @@ class FigmaNode:
         # Layout properties
         self.absolute_bounds = data.get("absoluteBoundingBox", {})
         self.layout_mode = data.get("layoutMode", "NONE")  # AUTO-LAYOUT
+        self.layout_positioning = data.get("layoutPositioning", "AUTO")  # "ABSOLUTE" = explicitly absolute within auto-layout parent
         self.constraints = data.get("constraints", {})
 
         # How this node sizes WITHIN its auto-layout parent (Figma API v2+).
@@ -54,10 +56,24 @@ class FigmaNode:
         }
         self.item_spacing = data.get("itemSpacing", 0)
         
-        # Visual properties
-        self.fills = data.get("fills", [])
-        self.strokes = data.get("strokes", [])
-        self.effects = data.get("effects", [])
+        # Visual properties — MCP YAML parser can return fills/strokes as a string
+        # instead of a list of dicts. Always normalise to List[dict] so every
+        # downstream caller can safely call fill.get() without an isinstance guard.
+        _raw_fills = data.get("fills", [])
+        self.fills: List[Dict] = (
+            [f for f in _raw_fills if isinstance(f, dict)]
+            if isinstance(_raw_fills, list) else []
+        )
+        _raw_strokes = data.get("strokes", [])
+        self.strokes: List[Dict] = (
+            [s for s in _raw_strokes if isinstance(s, dict)]
+            if isinstance(_raw_strokes, list) else []
+        )
+        _raw_effects = data.get("effects", [])
+        self.effects: List[Dict] = (
+            [e for e in _raw_effects if isinstance(e, dict)]
+            if isinstance(_raw_effects, list) else []
+        )
         self.corner_radius = data.get("cornerRadius", 0)
         self.opacity = data.get("opacity", 1)
         
@@ -480,11 +496,15 @@ class ComponentClassifier:
 
     @staticmethod
     def _has_solid_fill(node: FigmaNode) -> bool:
-        return any(f.get("type") == "SOLID" and f.get("visible", True) for f in node.fills)
+        if not isinstance(node.fills, list):
+            return False
+        return any(isinstance(f, dict) and f.get("type") == "SOLID" and f.get("visible", True) for f in node.fills)
 
     @staticmethod
     def _has_image_fill(node: FigmaNode) -> bool:
-        return any(f.get("type") == "IMAGE" and f.get("visible", True) for f in node.fills)
+        if not isinstance(node.fills, list):
+            return False
+        return any(isinstance(f, dict) and f.get("type") == "IMAGE" and f.get("visible", True) for f in node.fills)
 
 
 class PropBasedGenerator:
@@ -786,31 +806,43 @@ class TailwindConverter:
         # Gap (item spacing)
         gap = node.item_spacing
         if gap > 0:
-            gap_class = TailwindConverter._size_to_tailwind(gap, "gap")
-            classes.append(gap_class)
-        
+            classes.append(TailwindConverter._size_to_tailwind(gap, "gap"))
+
+        # Wrap — Figma: layoutWrap "WRAP" | "NO_WRAP"
+        if node.raw.get("layoutWrap") == "WRAP":
+            classes.append("flex-wrap")
+
         return classes
     
     @staticmethod
     def get_spacing_classes(node: FigmaNode) -> List[str]:
-        """Convert padding/margin to Tailwind"""
+        """Convert padding to Tailwind, using the most compact shorthand available.
+
+        Priority:  p-  >  px- py-  >  individual pt- pr- pb- pl-
+        """
         classes = []
-        
-        p = node.padding
-        # Check if all sides are equal
-        if p["top"] == p["right"] == p["bottom"] == p["left"] and p["top"] > 0:
-            classes.append(TailwindConverter._size_to_tailwind(p["top"], "p"))
+        t = TailwindConverter._size_to_tailwind
+
+        top    = node.padding["top"]
+        right  = node.padding["right"]
+        bottom = node.padding["bottom"]
+        left   = node.padding["left"]
+
+        if top == right == bottom == left:
+            if top > 0:
+                classes.append(t(top, "p"))
+        elif top == bottom and right == left:
+            # px- / py- shorthand
+            if top > 0:
+                classes.append(t(top, "py"))
+            if right > 0:
+                classes.append(t(right, "px"))
         else:
-            # Individual sides
-            if p["top"] > 0:
-                classes.append(TailwindConverter._size_to_tailwind(p["top"], "pt"))
-            if p["right"] > 0:
-                classes.append(TailwindConverter._size_to_tailwind(p["right"], "pr"))
-            if p["bottom"] > 0:
-                classes.append(TailwindConverter._size_to_tailwind(p["bottom"], "pb"))
-            if p["left"] > 0:
-                classes.append(TailwindConverter._size_to_tailwind(p["left"], "pl"))
-        
+            if top    > 0: classes.append(t(top,    "pt"))
+            if right  > 0: classes.append(t(right,  "pr"))
+            if bottom > 0: classes.append(t(bottom, "pb"))
+            if left   > 0: classes.append(t(left,   "pl"))
+
         return classes
     
     @staticmethod
@@ -831,7 +863,12 @@ class TailwindConverter:
         # ── Child inside an explicit auto-layout parent ───────────────────────
         # These Figma API v2+ fields tell us exactly how the child should size
         # within the flex container — independently of the child's own content sizing.
-        if parent is not None and parent.has_auto_layout:
+        # Exception: if the child is layoutPositioning=ABSOLUTE it is taken OUT of
+        # flex flow and must be sized like a non-flex node (primaryAxisSizingMode /
+        # absoluteBoundingBox), not by layout_sizing_h/v.
+        if (parent is not None
+                and parent.has_auto_layout
+                and node.layout_positioning != "ABSOLUTE"):
             horiz = parent.layout_mode == "HORIZONTAL"
 
             # Main axis (width for HORIZONTAL parent, height for VERTICAL parent)
@@ -874,7 +911,7 @@ class TailwindConverter:
             if node.primary_axis_sizing == "FIXED":
                 w = int(node.width)
                 if w > 0:
-                    classes.append(f"w-[{w}px]" if w <= 640 else "w-full")
+                    classes.append(f"w-[{w}px]")
             elif node.primary_axis_sizing == "FILL":
                 classes.append("w-full")
 
@@ -899,7 +936,7 @@ class TailwindConverter:
             if node.counter_axis_sizing == "FIXED":
                 w = int(node.width)
                 if w > 0:
-                    classes.append(f"w-[{w}px]" if w <= 640 else "w-full")
+                    classes.append(f"w-[{w}px]")
             elif node.counter_axis_sizing == "FILL":
                 classes.append("w-full")
 
@@ -908,7 +945,7 @@ class TailwindConverter:
             w = int(node.width)
             h = int(node.height)
             if w > 0:
-                classes.append(f"w-[{w}px]" if w <= 640 else "w-full")
+                classes.append(f"w-[{w}px]")
             if h > 0:
                 classes.append(f"h-[{h}px]")
 
@@ -927,20 +964,22 @@ class TailwindConverter:
         _NO_BG_TYPES = {"TEXT", "VECTOR", "BOOLEAN_OPERATION"}
         if node.type not in _NO_BG_TYPES and node.fills and len(node.fills) > 0:
             fill = node.fills[0]
-            if fill.get("type") == "SOLID":
+            if fill.get("type") == "SOLID" and fill.get("visible", True):
                 color = fill.get("color", {})
-                bg_class = TailwindConverter._color_to_tailwind(color, "bg")
+                fill_opacity = fill.get("opacity", 1.0)
+                bg_class = TailwindConverter._color_to_tailwind(color, "bg", fill_opacity)
                 if bg_class:
                     classes.append(bg_class)
-        
+
         # Border
         if node.strokes and len(node.strokes) > 0:
             stroke = node.strokes[0]
-            if stroke.get("type") == "SOLID":
+            if stroke.get("type") == "SOLID" and stroke.get("visible", True):
                 color = stroke.get("color", {})
                 weight = node.raw.get("strokeWeight", 1)
-                classes.append(f"border-[{weight}px]")
-                border_class = TailwindConverter._color_to_tailwind(color, "border")
+                classes.append(f"border-[{int(weight)}px]")
+                stroke_opacity = stroke.get("opacity", 1.0)
+                border_class = TailwindConverter._color_to_tailwind(color, "border", stroke_opacity)
                 if border_class:
                     classes.append(border_class)
         
@@ -1002,34 +1041,37 @@ class TailwindConverter:
         elif align == "JUSTIFIED":
             classes.append("text-justify")
         
-        # Line height
+        # Line height — use exact pixel value; only use named classes for exact standard ratios
         line_height = style.get("lineHeightPx")
-        if line_height and size:
+        lh_unit = style.get("lineHeightUnit", "AUTO")
+        if line_height and lh_unit != "AUTO" and size:
             ratio = line_height / size
-            if abs(ratio - 1.0) < 0.1:
-                classes.append("leading-none")
-            elif abs(ratio - 1.25) < 0.1:
-                classes.append("leading-tight")
-            elif abs(ratio - 1.5) < 0.1:
-                classes.append("leading-normal")
-            elif abs(ratio - 1.75) < 0.1:
-                classes.append("leading-relaxed")
-            elif abs(ratio - 2.0) < 0.1:
-                classes.append("leading-loose")
+            named = {1.0: "leading-none", 1.25: "leading-tight", 1.375: "leading-snug",
+                     1.5: "leading-normal", 1.625: "leading-relaxed", 2.0: "leading-loose"}
+            matched = next((cls for ratio_key, cls in named.items() if abs(ratio - ratio_key) < 0.04), None)
+            if matched:
+                classes.append(matched)
+            else:
+                classes.append(f"leading-[{int(round(line_height))}px]")
 
-        # Letter spacing
-        letter_spacing = style.get("letterSpacing")
+        # Letter spacing — respect unit: PERCENT means em, PIXELS means px
+        letter_spacing = style.get("letterSpacing", 0)
+        ls_unit = style.get("letterSpacingUnit", "PIXELS")
         if letter_spacing and letter_spacing != 0:
-            ls = round(letter_spacing, 2)
-            if ls > 0:
-                classes.append(f"tracking-[{ls}px]")
+            if ls_unit == "PERCENT":
+                ls_em = round(letter_spacing / 100, 4)
+                classes.append(f"tracking-[{ls_em}em]")
+            else:
+                ls_px = round(letter_spacing, 2)
+                classes.append(f"tracking-[{ls_px}px]")
 
-        # Text color
+        # Text color — include fill-layer opacity
         if node.fills and len(node.fills) > 0:
             fill = node.fills[0]
-            if fill.get("type") == "SOLID":
+            if fill.get("type") == "SOLID" and fill.get("visible", True):
                 color = fill.get("color", {})
-                text_class = TailwindConverter._color_to_tailwind(color, "text")
+                fill_opacity = fill.get("opacity", 1.0)
+                text_class = TailwindConverter._color_to_tailwind(color, "text", fill_opacity)
                 if text_class:
                     classes.append(text_class)
 
@@ -1037,28 +1079,40 @@ class TailwindConverter:
     
     @staticmethod
     def get_effect_classes(node: FigmaNode) -> List[str]:
-        """Convert effects to Tailwind"""
+        """Convert effects (shadows, opacity) to Tailwind."""
         classes = []
-        
+
         for effect in node.effects:
-            if effect.get("type") == "DROP_SHADOW":
-                radius = effect.get("radius", 0)
-                if radius <= 2:
-                    classes.append("shadow-sm")
-                elif radius <= 4:
-                    classes.append("shadow")
-                elif radius <= 8:
-                    classes.append("shadow-md")
-                elif radius <= 16:
-                    classes.append("shadow-lg")
+            if not effect.get("visible", True):
+                continue
+            etype = effect.get("type")
+            if etype in ("DROP_SHADOW", "INNER_SHADOW"):
+                ox = int(effect.get("offset", {}).get("x", 0))
+                oy = int(effect.get("offset", {}).get("y", 0))
+                blur   = int(effect.get("radius", 0))
+                spread = int(effect.get("spread", 0))
+                c = effect.get("color", {})
+                r = int(c.get("r", 0) * 255)
+                g = int(c.get("g", 0) * 255)
+                b = int(c.get("b", 0) * 255)
+                a = round(c.get("a", 1.0), 2)
+
+                # Tailwind arbitrary shadow: shadow-[Xpx_Ypx_blur_spread_color]
+                shadow_val = f"{ox}px_{oy}px_{blur}px"
+                if spread:
+                    shadow_val += f"_{spread}px"
+                if a < 1:
+                    shadow_val += f"_rgba({r},{g},{b},{a})"
                 else:
-                    classes.append("shadow-xl")
-        
-        # Opacity
+                    shadow_val += f"_rgb({r},{g},{b})"
+
+                prefix = "shadow-[inset_" if etype == "INNER_SHADOW" else "shadow-["
+                classes.append(f"{prefix}{shadow_val}]")
+
+        # Node-level opacity — use arbitrary value to avoid Tailwind step mismatch
         if node.opacity < 1:
-            opacity_percent = int(node.opacity * 100)
-            classes.append(f"opacity-{opacity_percent}")
-        
+            classes.append(f"opacity-[{round(node.opacity, 2)}]")
+
         return classes
     
     @staticmethod
@@ -1083,26 +1137,35 @@ class TailwindConverter:
         return f"{prefix}-[{size}px]"
 
     @staticmethod
-    def _color_to_tailwind(color: Dict, prefix: str) -> Optional[str]:
-        """Convert RGB color to exact hex Tailwind class"""
+    def _color_to_tailwind(color: Dict, prefix: str, fill_opacity: float = 1.0) -> Optional[str]:
+        """Convert RGBA color to exact hex Tailwind class, with optional opacity modifier.
+
+        fill_opacity: the fill-layer opacity field (0-1) multiplied with color.a to
+        produce the final effective alpha. Emits `bg-[#hex]/NN` when alpha < 1.
+        """
         r = int(color.get("r", 0) * 255)
         g = int(color.get("g", 0) * 255)
         b = int(color.get("b", 0) * 255)
+        a = color.get("a", 1.0) * fill_opacity
 
-        # Pure white/black - use standard names
-        if r >= 255 and g >= 255 and b >= 255:
-            return f"{prefix}-white"
-        if r == 0 and g == 0 and b == 0:
-            return f"{prefix}-black"
-
-        # Transparent check
-        a = color.get("a", 1)
-        if a == 0:
+        if a <= 0:
             return f"{prefix}-transparent"
 
-        # Use exact hex color for everything else
-        hex_color = f"#{r:02x}{g:02x}{b:02x}"
-        return f"{prefix}-[{hex_color}]"
+        # Determine base class (white/black use named tokens, everything else uses hex)
+        if r >= 255 and g >= 255 and b >= 255:
+            base = f"{prefix}-white"
+        elif r == 0 and g == 0 and b == 0:
+            base = f"{prefix}-black"
+        else:
+            hex_color = f"#{r:02x}{g:02x}{b:02x}"
+            base = f"{prefix}-[{hex_color}]"
+
+        # Append Tailwind opacity modifier when not fully opaque
+        if a < 0.99:
+            opacity_pct = round(a * 100)
+            return f"{base}/{opacity_pct}"
+
+        return base
 
 
 class ResponsiveLayoutEngine:
@@ -1141,108 +1204,210 @@ class ResponsiveLayoutEngine:
 class ImageDownloader:
     """Downloads and manages images from Figma"""
     
+    # Persistent cross-workflow cache: mcp-automation/image_cache/{file_id}/{node_id}.png
+    PERSISTENT_CACHE_ROOT = Path(__file__).parent.parent.parent / "image_cache"
+
     def __init__(self, figma_token: str):
         self.figma_token = figma_token.strip()  # strip whitespace/newlines from .env
         self.api_base = "https://api.figma.com/v1"
+        self.s3_base = "https://figma-alpha-api.s3.us-west-2.amazonaws.com/img"
 
     async def download_images(self, file_id: str, nodes: List[FigmaNode], output_dir: Path) -> Dict[str, str]:
         """Download all image-fill images and return mapping of node_id -> local_path.
 
-        Strategy (two-pass):
-          1. Serve from disk cache (fastest, no API call).
-          2. Fetch missing images via GET /v1/files/{key}/images — one lightweight
-             call that returns hash→S3-URL for every image fill in the file.
-             This endpoint is NOT rate-limited like /v1/images/ (which renders nodes
-             on-demand and exhausts the quota immediately with many images).
-
-        Falls back to the node-render endpoint (/v1/images/) only when the file-images
-        endpoint returns no URL for a node (e.g. the fill references a non-raster asset).
+        Pass order (fastest/cheapest first):
+          1. Persistent cross-workflow cache  mcp-automation/image_cache/{file_id}/
+             Survives across ALL workflows — zero API calls if previously fetched.
+          2. Project-local disk cache  public/images/  (within current build dir).
+          3. S3 direct download via imageRef hash
+             https://figma-alpha-api.s3.us-west-2.amazonaws.com/img/{imageRef}
+             Completely bypasses the rate-limited export API.
+          4. GET /v1/files/{key}/images — hash→S3 URL, one lightweight API call.
+          5. Node-render endpoint /v1/images/ — last resort, heavy & rate-limited.
         """
-        # Collect all nodes with image fills
         image_nodes = [n for n in nodes if self._has_image_fill(n)]
         if not image_nodes:
             return {}
 
+        # ── Diagnostic: classify nodes upfront ───────────────────────────────
+        s3_eligible = [
+            n for n in image_nodes
+            if any(f.get("type") == "IMAGE" and f.get("imageRef") for f in n.fills)
+        ]
+        render_only = [n for n in image_nodes if n not in s3_eligible]
+        logger.info(
+            f"Image download plan: {len(image_nodes)} total — "
+            f"{len(s3_eligible)} have imageRef (file-images API eligible), "
+            f"{len(render_only)} have no imageRef (node-render API required)"
+        )
+
         images_dir = output_dir / "public" / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Pass 1: serve from disk cache ────────────────────────────────────
+        persistent_dir = self.PERSISTENT_CACHE_ROOT / file_id
+        persistent_dir.mkdir(parents=True, exist_ok=True)
+
         image_map: Dict[str, str] = {}
         missing_nodes: List[FigmaNode] = []
+
+        # ── Pass 1: persistent cross-workflow cache ───────────────────────────
         for node in image_nodes:
             safe_id = node.id.replace(':', '_').replace('/', '_')
-            filepath = images_dir / f"{safe_id}.png"
-            if filepath.exists() and filepath.stat().st_size > 0:
+            persistent_path = persistent_dir / f"{safe_id}.png"
+            project_path = images_dir / f"{safe_id}.png"
+
+            if persistent_path.exists() and persistent_path.stat().st_size > 0:
+                # Copy into project dir if not already there
+                if not (project_path.exists() and project_path.stat().st_size > 0):
+                    import shutil
+                    shutil.copy2(persistent_path, project_path)
                 image_map[node.id] = f"/images/{safe_id}.png"
-                logger.debug(f"Cached image: {safe_id}.png")
+                logger.debug(f"Persistent cache hit: {safe_id}.png")
             else:
                 missing_nodes.append(node)
 
-        if image_map:
+        if len(image_map):
             logger.info(
-                f"Cache hit: {len(image_map)}/{len(image_nodes)} images already in public/images/ — skipping API for those"
+                f"Persistent cache: {len(image_map)}/{len(image_nodes)} images reused"
             )
         if not missing_nodes:
-            logger.info("All images served from disk cache — skipping Figma API entirely")
+            logger.info("All images served from persistent cache — no API calls needed")
+            return image_map
+
+        # ── Pass 2: project-local disk cache ─────────────────────────────────
+        still_after_local: List[FigmaNode] = []
+        for node in missing_nodes:
+            safe_id = node.id.replace(':', '_').replace('/', '_')
+            filepath = images_dir / f"{safe_id}.png"
+            if filepath.exists() and filepath.stat().st_size > 0:
+                # Backfill persistent cache
+                import shutil
+                shutil.copy2(filepath, persistent_dir / f"{safe_id}.png")
+                image_map[node.id] = f"/images/{safe_id}.png"
+                logger.debug(f"Project cache hit: {safe_id}.png")
+            else:
+                still_after_local.append(node)
+
+        if len(still_after_local) < len(missing_nodes):
+            logger.info(
+                f"Project cache: {len(missing_nodes) - len(still_after_local)} more hits"
+            )
+        missing_nodes = still_after_local
+        if not missing_nodes:
             return image_map
 
         logger.info(f"{len(image_map)} cached, {len(missing_nodes)} need downloading")
 
-        # ── Pass 2: GET /v1/files/{key}/images — hash → S3 URL, one call ─────
-        # Build a hash→node_id index from the image-fill refs stored in Figma data.
-        hash_to_nodes: Dict[str, List[FigmaNode]] = {}
+        # Build imageRef → node mapping for the remaining nodes
+        ref_to_nodes: Dict[str, List[FigmaNode]] = {}
         for node in missing_nodes:
             for fill in node.fills:
                 if fill.get("type") == "IMAGE":
                     ref = fill.get("imageRef", "")
                     if ref:
-                        hash_to_nodes.setdefault(ref, []).append(node)
+                        ref_to_nodes.setdefault(ref, []).append(node)
 
-        file_image_urls: Dict[str, str] = {}  # hash → download URL
-        if hash_to_nodes:
-            file_image_urls = await self._fetch_file_image_urls(file_id)
-            logger.info(f"File-images endpoint returned {len(file_image_urls)} hash URLs")
-
-        # ── Pass 3: download via hash URLs ────────────────────────────────────
+        # ── Pass 3: S3 direct download via imageRef (no API call) ────────────
         still_missing: List[FigmaNode] = []
+        nodes_resolved_by_s3: set = set()
+
         async with aiohttp.ClientSession() as session:
             for node in missing_nodes:
                 safe_id = node.id.replace(':', '_').replace('/', '_')
                 filepath = images_dir / f"{safe_id}.png"
 
-                # Find the download URL from the hash map
-                dl_url: Optional[str] = None
+                image_ref: Optional[str] = None
                 for fill in node.fills:
-                    if fill.get("type") == "IMAGE":
-                        ref = fill.get("imageRef", "")
-                        if ref and ref in file_image_urls:
-                            dl_url = file_image_urls[ref]
-                            break
+                    if fill.get("type") == "IMAGE" and fill.get("imageRef"):
+                        image_ref = fill["imageRef"]
+                        break
 
-                if dl_url:
-                    await self._download_file(session, dl_url, filepath)
-                    if filepath.exists() and filepath.stat().st_size > 0:
+                if image_ref:
+                    s3_url = f"{self.s3_base}/{image_ref}"
+                    ok = await self._try_s3_direct(session, s3_url, filepath)
+                    if ok:
+                        import shutil
+                        shutil.copy2(filepath, persistent_dir / f"{safe_id}.png")
                         image_map[node.id] = f"/images/{safe_id}.png"
-                        logger.info(f"Downloaded (hash): {safe_id}.png")
+                        nodes_resolved_by_s3.add(node.id)
+                        logger.info(f"S3 direct: {safe_id}.png (ref={image_ref[:12]}…)")
                         continue
 
                 still_missing.append(node)
 
-        # ── Pass 4: fallback — node-render endpoint for anything still missing ─
+        if nodes_resolved_by_s3:
+            logger.info(f"S3 direct bypassed API for {len(nodes_resolved_by_s3)} images")
+
+        # ── Pass 4: file-images API (hash → signed S3 URL, one call) ────────────────
+        if still_missing:
+            pending_refs = {
+                fill["imageRef"]
+                for n in still_missing
+                for fill in n.fills
+                if fill.get("type") == "IMAGE" and fill.get("imageRef")
+            }
+            file_image_urls: Dict[str, str] = {}
+            if pending_refs:
+                logger.info(
+                    f"File-images API: requesting {len(pending_refs)} hashes "
+                    f"(samples: {', '.join(list(pending_refs)[:3])}…)"
+                )
+                file_image_urls = await self._fetch_file_image_urls(file_id)
+                matched = sum(1 for r in pending_refs if r in file_image_urls)
+                logger.info(
+                    f"File-images API: {len(file_image_urls)} total hashes returned, "
+                    f"{matched}/{len(pending_refs)} of our refs matched"
+                )
+
+            render_needed: List[FigmaNode] = []
+            async with aiohttp.ClientSession() as session:
+                for node in still_missing:
+                    safe_id = node.id.replace(':', '_').replace('/', '_')
+                    filepath = images_dir / f"{safe_id}.png"
+
+                    dl_url: Optional[str] = None
+                    for fill in node.fills:
+                        if fill.get("type") == "IMAGE":
+                            ref = fill.get("imageRef", "")
+                            if ref and ref in file_image_urls:
+                                dl_url = file_image_urls[ref]
+                                break
+
+                    if dl_url:
+                        await self._download_file(session, dl_url, filepath)
+                        if filepath.exists() and filepath.stat().st_size > 0:
+                            import shutil
+                            shutil.copy2(filepath, persistent_dir / f"{safe_id}.png")
+                            image_map[node.id] = f"/images/{safe_id}.png"
+                            logger.info(f"Downloaded (file-images API): {safe_id}.png")
+                            continue
+
+                    render_needed.append(node)
+
+            still_missing = render_needed
+
+        # ── Pass 5: node-render endpoint — last resort ────────────────────────
         if still_missing:
             logger.info(
-                f"{len(still_missing)} images not in file-images endpoint"
-                " — falling back to node-render API"
+                f"{len(still_missing)} images exhausted all cache/S3 strategies"
+                " — falling back to rate-limited node-render API"
             )
-            CHUNK = 25
+            # Send 2 nodes per request to stay well under rate limits.
+            # Wait 6s between requests (proactive throttle, avoids hitting 429).
+            # On 429: exponential backoff 30s → 60s → 120s → 240s.
+            CHUNK = 2
+            INTER_CHUNK_DELAY = 6  # seconds between successful requests
             render_urls: Dict[str, str] = {}
             chunks = [still_missing[i:i + CHUNK] for i in range(0, len(still_missing), CHUNK)]
             for ci, chunk in enumerate(chunks):
                 chunk_ids = [n.id for n in chunk]
-                logger.info(f"Render-fetch chunk {ci + 1}/{len(chunks)} ({len(chunk_ids)} nodes)")
-                render_urls.update(await self._fetch_image_urls(file_id, chunk_ids))
+                logger.info(
+                    f"Node-render chunk {ci + 1}/{len(chunks)}: {chunk_ids}"
+                )
+                urls = await self._fetch_image_urls(file_id, chunk_ids)
+                render_urls.update(urls)
                 if ci < len(chunks) - 1:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(INTER_CHUNK_DELAY)
 
             async with aiohttp.ClientSession() as session:
                 for node in still_missing:
@@ -1254,8 +1419,10 @@ class ImageDownloader:
                         continue
                     await self._download_file(session, url, filepath)
                     if filepath.exists() and filepath.stat().st_size > 0:
+                        import shutil
+                        shutil.copy2(filepath, persistent_dir / f"{safe_id}.png")
                         image_map[node.id] = f"/images/{safe_id}.png"
-                        logger.info(f"Downloaded (render): {safe_id}.png")
+                        logger.info(f"Downloaded (node-render): {safe_id}.png")
                     else:
                         logger.warning(f"Render download empty/failed for {node.id}")
 
@@ -1266,10 +1433,42 @@ class ImageDownloader:
         logger.info(f"Image download complete: {len(image_map)}/{len(image_nodes)} images available")
         return image_map
 
+    async def _try_s3_direct(
+        self, session: aiohttp.ClientSession, url: str, filepath: Path
+    ) -> bool:
+        """Attempt to download an image directly from Figma's S3 CDN.
+
+        Figma stores image fills at:
+          https://figma-alpha-api.s3.us-west-2.amazonaws.com/img/{imageRef}
+        This works for public/community files. Team/private files return 403
+        (bucket is not publicly readable) — in that case the file-images API
+        (Pass 4) provides signed S3 URLs that do work.
+        Returns True if the file was downloaded successfully.
+        """
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    if content:
+                        with open(filepath, "wb") as f:
+                            f.write(content)
+                        return filepath.exists() and filepath.stat().st_size > 0
+                elif resp.status == 403 or resp.status == 404:
+                    # Not on CDN (vector/component node) — skip silently
+                    logger.debug(f"S3 direct {resp.status} for {url[:60]}…")
+                else:
+                    logger.debug(f"S3 direct returned {resp.status} for {url[:60]}…")
+        except Exception as e:
+            logger.debug(f"S3 direct failed ({url[:60]}…): {e}")
+        return False
+
     async def _fetch_file_image_urls(self, file_id: str) -> Dict[str, str]:
-        """GET /v1/files/{key}/images — returns {imageRef_hash: s3_url} for all
+        """GET /v1/files/{key}/images — returns {imageRef_hash: signed_s3_url} for all
         image fills in the file.  One lightweight call, not rate-limited like the
         node-render endpoint.  Returns empty dict on any failure.
+
+        NOTE: The Figma API wraps the hash map under response["meta"]["images"],
+        NOT at the top-level response["images"] key.
         """
         token = self.figma_token.strip()
         url = f"{self.api_base}/files/{file_id}/images"
@@ -1283,9 +1482,21 @@ class ImageDownloader:
                 )
             resp = await loop.run_in_executor(None, _get)
             if resp.status_code == 200:
-                return resp.json().get("images") or {}
+                data = resp.json()
+                # Response shape: {"error": false, "status": 200, "meta": {"images": {...}}, "i18n": null}
+                # Images are under meta.images, NOT top-level images.
+                images = (
+                    data.get("meta", {}).get("images")
+                    or data.get("images")  # fallback if Figma ever changes shape
+                    or {}
+                )
+                logger.info(
+                    f"File-images API: {len(images)} hashes returned"
+                    + (f" (sample: {next(iter(images))[:16]}…)" if images else " — EMPTY")
+                )
+                return images
             logger.warning(
-                f"File-images endpoint returned {resp.status_code}: {resp.text[:200]}"
+                f"File-images endpoint returned {resp.status_code}: {resp.text[:300]}"
             )
         except Exception as e:
             logger.warning(f"File-images fetch failed: {e}")
@@ -1293,18 +1504,23 @@ class ImageDownloader:
     
     def _has_image_fill(self, node: FigmaNode) -> bool:
         """Check if node has image fill"""
+        if not isinstance(node.fills, list):
+            return False
         for fill in node.fills:
-            if fill.get("type") == "IMAGE":
+            if isinstance(fill, dict) and fill.get("type") == "IMAGE":
                 return True
         return False
     
     async def _fetch_image_urls(self, file_id: str, node_ids: List[str]) -> Dict[str, str]:
-        """Fetch image export URLs from Figma API.
+        """Fetch image export URLs via the node-render endpoint /v1/images/.
 
-        Uses the synchronous `requests` library (same as _fetch_file which works reliably)
-        rather than aiohttp to avoid header-encoding differences.
-        Token is stripped of whitespace before use.
-        Retries on 429; tries both X-Figma-Token and Authorization: Bearer on 403.
+        LAST RESORT ONLY — heavy, rate-limited (429 common with many nodes).
+        Called only after persistent cache, project cache, S3 direct, and
+        file-images API have all failed to supply an image.
+
+        Uses synchronous `requests` (same as _fetch_file) to avoid aiohttp
+        header-encoding differences. Retries on 429 with escalating backoff;
+        tries both X-Figma-Token and Authorization: Bearer on 403.
         """
         if not node_ids:
             return {}
@@ -1322,9 +1538,9 @@ class ImageDownloader:
         url = f"{self.api_base}/images/{file_id}"
         params = {"ids": ids_param, "format": "png", "scale": "2"}
 
-        # Escalating waits: 120s → 240s → 480s
-        RATE_LIMIT_WAITS = [120, 240, 480]
-        max_retries = 3
+        # Exponential backoff on 429: 30s → 60s → 120s → 240s (4 attempts)
+        max_retries = 4
+        base_wait = 30
         loop = asyncio.get_event_loop()
 
         for attempt in range(max_retries):
@@ -1341,26 +1557,27 @@ class ImageDownloader:
 
                     if response.status_code == 403:
                         logger.warning(
-                            f"Image API 403 with header {header_label}"
-                            f" — response body: {response.text[:500]}"
+                            f"Node-render API 403 with {header_label}"
+                            f" — body: {response.text[:500]}"
                         )
                         continue  # try next header variant
 
                     if response.status_code == 429:
-                        wait = RATE_LIMIT_WAITS[min(attempt, len(RATE_LIMIT_WAITS) - 1)]
+                        wait = base_wait * (2 ** attempt)  # 30, 60, 120, 240
                         logger.warning(
-                            f"Image API rate limit (429). "
-                            f"Waiting {wait}s (attempt {attempt + 1}/{max_retries})"
+                            f"Node-render API rate limit (429) on attempt {attempt + 1}/{max_retries}. "
+                            f"Waiting {wait}s before retry…"
                         )
                         await asyncio.sleep(wait)
                         break  # break header loop, retry outer attempt
 
-                    logger.warning(f"Image fetch returned {response.status_code}: {response.text[:200]}")
+                    logger.warning(f"Node-render fetch returned {response.status_code}: {response.text[:200]}")
                     return {}
 
                 except Exception as e:
-                    logger.warning(f"Image fetch attempt {attempt + 1} ({header_label}) failed: {e}")
+                    logger.warning(f"Node-render attempt {attempt + 1} ({header_label}) failed: {e}")
 
+        logger.error(f"Node-render API exhausted all {max_retries} attempts for {len(node_ids)} nodes")
         return {}
     
     async def _download_file(self, session: aiohttp.ClientSession, url: str, filepath: Path):
@@ -1387,70 +1604,141 @@ class ReactCodeGenerator:
     def _infer_top_layout(self, root: FigmaNode) -> bool:
         """Detect sidebar+content pattern and mutate nodes to enable flex generation.
 
-        When a Figma frame has no auto-layout the programmatic generator falls back
-        to absolute pixel coordinates, producing a broken-looking page.  This method
-        inspects the direct children's dimensions and, when it finds a narrow+tall
-        (sidebar) child alongside a wide+tall (content) child, switches the root
-        frame to HORIZONTAL flex in-memory so that the existing Tailwind path emits
-        the correct flex classes rather than `absolute left-[X]px top-[Y]px`.
+        Two detection strategies:
+          A) Simple (2-6 visible children): find one narrow+tall sidebar child and one
+             wide+tall content child — matches clean 2-panel designs.
+          B) Multi-child (any count): detect sidebar by absolute position (leftmost, narrow,
+             tall enough to be a nav panel) and treat all other visible children as the
+             "content area" rendered inside a virtual wrapper div.
 
-        Nothing is hardcoded — only relative dimension ratios are used.
-        Returns True if inference was applied.
+        Returns True if inference was applied.  Nothing is hardcoded — only relative ratios.
         """
         if root.has_auto_layout:
             return False  # already has explicit layout
 
         visible = [c for c in root.children if c.visible]
-        if not (2 <= len(visible) <= 6):
+        if len(visible) < 2:
             return False
 
         total_w = root.width or 1440
         total_h = root.height or 900
+        root_x = root.absolute_bounds.get("x", 0) if root.absolute_bounds else 0
+        root_y = root.absolute_bounds.get("y", 0) if root.absolute_bounds else 0
 
+        # ── Strategy A: simple 2-child sidebar+single-content ────────────────
+        if 2 <= len(visible) <= 6:
+            sidebar_node = None
+            content_node = None
+            for child in visible[:6]:
+                w, h = child.width, child.height
+                if w > 0 and h > 0 and w < total_w * 0.28 and h > total_h * 0.70:
+                    if sidebar_node is None:
+                        sidebar_node = child
+                elif w > total_w * 0.50 and h > total_h * 0.50:
+                    if content_node is None:
+                        content_node = child
+
+            if sidebar_node and content_node:
+                root.layout_mode = "HORIZONTAL"
+                root.primary_axis_align = "MIN"
+                root.counter_axis_align = "MIN"
+                root.primary_axis_sizing = "FILL"
+                root.counter_axis_sizing = "FILL"
+                root._infer_hscreen = True
+
+                sidebar_node.layout_mode = "VERTICAL"
+                sidebar_node.primary_axis_sizing = "FILL"
+                sidebar_node.counter_axis_sizing = "FIXED"
+                sidebar_node.layout_sizing_h = "FIXED"
+                sidebar_node.layout_sizing_v = "FILL"
+                sidebar_node._infer_shrink_0 = True
+
+                content_node.layout_mode = "VERTICAL"
+                content_node.primary_axis_sizing = "FILL"
+                content_node.counter_axis_sizing = "FILL"
+                content_node.layout_sizing_h = "FILL"
+                content_node.layout_sizing_v = "FILL"
+                content_node._infer_flex_one = True
+
+                logger.info(
+                    f"[Layout Inference A] sidebar='{sidebar_node.name}' (w={int(sidebar_node.width)}px)"
+                    f" + content='{content_node.name}' → flex h-screen"
+                )
+                return True
+
+        # ── Strategy B: multi-child — detect sidebar by position ─────────────
+        # Sidebar heuristic: leftmost child (rel_x < 5% of canvas), narrower than
+        # 32% of canvas, and at least 30% as tall as the canvas (scrollable ok).
         sidebar_node = None
-        content_node = None
-
-        for child in visible[:5]:
+        for child in visible:
+            if not child.absolute_bounds:
+                continue
+            child_rel_x = child.absolute_bounds.get("x", 0) - root_x
             w, h = child.width, child.height
-            if w > 0 and h > 0 and w < total_w * 0.28 and h > total_h * 0.70:
-                if sidebar_node is None:
-                    sidebar_node = child
-            elif w > total_w * 0.50 and h > total_h * 0.50:
-                if content_node is None:
-                    content_node = child
+            if (w > 0 and h > 0
+                    and child_rel_x < total_w * 0.05   # hugs left edge
+                    and w < total_w * 0.32             # narrower than 32%
+                    and h > total_h * 0.30):           # tall enough (scrollable sidebar ok)
+                sidebar_node = child
+                break
 
-        if not (sidebar_node and content_node):
+        if not sidebar_node:
             return False
 
-        # ── Root: horizontal flex, full viewport ─────────────────────────────
+        sidebar_w = int(sidebar_node.width)
+        content_nodes = [c for c in visible if c.id != sidebar_node.id]
+
+        # Mutate root → horizontal flex
         root.layout_mode = "HORIZONTAL"
         root.primary_axis_align = "MIN"
         root.counter_axis_align = "MIN"
-        root.primary_axis_sizing = "FILL"   # → w-full
-        root.counter_axis_sizing = "FILL"   # → h-full; _infer_hscreen upgrades to h-screen
-        root._infer_hscreen = True          # signal: replace h-full with h-screen overflow-hidden
+        root._infer_hscreen = True
+        # Signal to generate_component: use multi-content wrapper instead of direct children
+        root._infer_sidebar_split = True
+        root._sidebar_node = sidebar_node
+        root._sidebar_width = sidebar_w
+        root._content_nodes = content_nodes
+        root._content_bounds = {
+            "x": root_x + sidebar_w,
+            "y": root_y,
+            "width": max(1, total_w - sidebar_w),
+            "height": total_h,
+        }
 
-        # ── Sidebar: vertical flex, fixed width, full height ─────────────────
+        # Mutate sidebar node
         sidebar_node.layout_mode = "VERTICAL"
-        sidebar_node.primary_axis_sizing = "FILL"    # → h-full
-        sidebar_node.counter_axis_sizing = "FIXED"   # → w-[Xpx] (keeps original Figma width)
-        sidebar_node.layout_sizing_h = "FIXED"       # child-sizing: exact pixel width
-        sidebar_node.layout_sizing_v = "FILL"        # child-sizing: full height
-        sidebar_node._infer_shrink_0 = True           # signal: add flex-shrink-0
-
-        # ── Content: vertical flex, fills remaining width ────────────────────
-        content_node.layout_mode = "VERTICAL"
-        content_node.primary_axis_sizing = "FILL"    # → h-full
-        content_node.counter_axis_sizing = "FILL"    # → w-full; _infer_flex_one upgrades to flex-1
-        content_node.layout_sizing_h = "FILL"        # child-sizing: fill remaining width
-        content_node.layout_sizing_v = "FILL"        # child-sizing: full height
-        content_node._infer_flex_one = True           # signal: use flex-1 min-w-0
+        sidebar_node.primary_axis_sizing = "FILL"
+        sidebar_node.counter_axis_sizing = "FIXED"
+        sidebar_node.layout_sizing_h = "FIXED"   # keep pixel width from absolute bounds
+        sidebar_node.layout_sizing_v = "FILL"    # height fills the flex row (h-full → _infer_shrink_0 upgrades to h-screen)
+        sidebar_node._infer_shrink_0 = True
 
         logger.info(
-            f"[Layout Inference] sidebar='{sidebar_node.name}' (w={int(sidebar_node.width)}px)"
-            f" + content='{content_node.name}' → flex h-screen"
+            f"[Layout Inference B] sidebar='{sidebar_node.name}' (w={sidebar_w}px)"
+            f" + {len(content_nodes)} content nodes → flex row h-screen"
         )
         return True
+
+    @staticmethod
+    def _rebase_origin(nodes: List['FigmaNode']) -> Tuple[float, float]:
+        """Compute the top-left origin of a group of nodes.
+
+        Returns (min_x, min_y) across all nodes that have absoluteBoundingBox data.
+        Use this as the virtual parent's origin when rendering children inside a
+        sub-region of the canvas, so the topmost/leftmost child lands at (0, 0).
+
+        Caller builds the virtual parent like:
+            ox, oy = ReactCodeGenerator._rebase_origin(content_nodes)
+            virtual_parent = FigmaNode({
+                "absoluteBoundingBox": {"x": ox, "y": oy, "width": ..., "height": ...},
+                ...
+            })
+        Then _generate_jsx(child, ..., parent=virtual_parent) yields
+        rel_x = child.abs_x - ox  and  rel_y = child.abs_y - oy.
+        """
+        xs = [n.absolute_bounds.get("x", 0) for n in nodes if n.absolute_bounds]
+        ys = [n.absolute_bounds.get("y", 0) for n in nodes if n.absolute_bounds]
+        return (min(xs) if xs else 0.0, min(ys) if ys else 0.0)
 
     def _infer_grid_layout(self, node: FigmaNode) -> Optional[Tuple[int, int]]:
         """Detect when a container's children form a regular grid.
@@ -1510,6 +1798,27 @@ class ReactCodeGenerator:
         an independent 'const SectionN' so the file stays modular and the AI can
         enhance each section separately within token limits (Fix 2 + Fix 3).
         """
+        # ── DEBUG: 2-level node-tree dump ─────────────────────────────────────
+        logger.info(
+            f"[NodeTree] {component_name} ROOT: name='{node.name}' type={node.type} "
+            f"size={int(node.width)}x{int(node.height)} layoutMode={node.layout_mode} "
+            f"children={len(node.children)}"
+        )
+        for i, child in enumerate(node.children[:12]):
+            logger.info(
+                f"[NodeTree]   [{i}] '{child.name}' type={child.type} "
+                f"size={int(child.width)}x{int(child.height)} "
+                f"layoutMode={child.layout_mode} layoutPositioning={child.raw.get('layoutPositioning','AUTO')} "
+                f"visible={child.visible} children={len(child.children)}"
+            )
+            for j, gc in enumerate(child.children[:4]):
+                logger.info(
+                    f"[NodeTree]     [{j}] '{gc.name}' type={gc.type} "
+                    f"size={int(gc.width)}x{int(gc.height)} "
+                    f"layoutMode={gc.layout_mode} layoutPositioning={gc.raw.get('layoutPositioning','AUTO')}"
+                )
+        # ──────────────────────────────────────────────────────────────────────
+
         self._infer_top_layout(node)  # detect sidebar+content and switch to flex before JSX gen
         node._is_root_frame = True    # mark so _generate_jsx can collapse blank top gap
 
@@ -1572,6 +1881,79 @@ export default function {component_name}() {{
 }}
 '''
 
+        # ── Sidebar-split: root = flex-row, sidebar + virtual content wrapper ─
+        # Triggered by Strategy B in _infer_top_layout when root has no auto-layout
+        # but has a detectable sidebar by position (e.g. ContentManagement with 7 children).
+        if getattr(node, '_infer_sidebar_split', False):
+            sidebar_node  = node._sidebar_node
+            content_nodes = node._content_nodes
+            sidebar_w     = node._sidebar_width
+
+            # Collect root bg color (so the flex wrapper keeps the canvas background)
+            root_bg = ""
+            for cls in self.tailwind.get_color_classes(node):
+                if cls.startswith("bg-"):
+                    root_bg = " " + cls
+                    break
+
+            # ── Sidebar ───────────────────────────────────────────────────────
+            sidebar_jsx = self._generate_jsx(sidebar_node, image_map, indent=3, parent=node)
+
+            # ── Content wrapper ───────────────────────────────────────────────
+            # Rebase origin: compute min(x), min(y) from the actual content nodes
+            # so the topmost/leftmost child lands at (0, 0) inside the panel.
+            # This is more accurate than root_x + sidebar_w, which can be off by
+            # a few pixels when Figma's sidebar doesn't perfectly align with the
+            # leftmost content child.
+            c_origin_x, c_origin_y = self._rebase_origin(content_nodes)
+            content_bounds = {
+                "x": c_origin_x,
+                "y": c_origin_y,
+                "width": max(1, node.width - sidebar_w),
+                "height": node.height,
+            }
+            virtual_parent = FigmaNode({
+                "id": "__content_wrapper__",
+                "name": "__content_wrapper__",
+                "type": "FRAME",
+                "layoutMode": "NONE",
+                "absoluteBoundingBox": content_bounds,
+                "children": [],
+                "visible": True,
+            })
+
+            content_jsxs = []
+            for child in content_nodes:
+                cjsx = self._generate_jsx(child, image_map, indent=4, parent=virtual_parent)
+                if cjsx:
+                    content_jsxs.append(cjsx)
+
+            i3 = "   "   # 3-space indent inside content wrapper
+            i4 = "    "  # 4-space indent for content children
+            content_inner = "\n".join(content_jsxs)
+            content_wrapper = (
+                f"{i3}<div className=\"flex-1 min-w-0 h-screen overflow-y-auto relative\">\n"
+                f"{content_inner}\n"
+                f"{i3}</div>"
+            )
+
+            logger.info(
+                f"[Sidebar Split] {component_name}: sidebar w={sidebar_w}px "
+                f"+ {len(content_nodes)} content nodes"
+            )
+
+            return f'''{imports_str}
+
+export default function {component_name}() {{
+  return (
+    <div className="flex flex-row w-screen h-screen overflow-hidden{root_bg}">
+{sidebar_jsx}
+{content_wrapper}
+    </div>
+  )
+}}
+'''
+
         # ── Standard single-pass generation ───────────────────────────────────
         jsx = self._generate_jsx(node, image_map, indent=2, parent=None)
 
@@ -1612,6 +1994,10 @@ export default function {component_name}() {{
         classes.extend(self.tailwind.get_effect_classes(node))
         classes.extend(self.responsive.get_responsive_classes(node))
 
+        # Figma clipsContent → overflow-hidden (children cropped to this frame's bounds)
+        if node.raw.get("clipsContent") and "overflow-hidden" not in classes:
+            classes.append("overflow-hidden")
+
         # ── Grid inference: detect regular grid of uniform children ──────────
         # Must run before absolute-positioning logic so we can suppress it below.
         if (not node.has_auto_layout
@@ -1627,12 +2013,14 @@ export default function {component_name}() {{
                     classes.append(f"gap-[{grid_gap}px]")
                 node._infer_grid = True   # children must NOT be absolutely positioned
 
-        # --- BUG 4 FIX: absolute positioning when parent has no auto-layout ---
+        # --- Absolute positioning ---
+        # Apply when:
+        #   A) parent has no auto-layout (layoutMode=NONE) — all children use absolute coords
+        #   B) node has layoutPositioning="ABSOLUTE" — explicitly absolute within auto-layout parent
         # Skip for children of a grid container — the grid handles positioning.
-        if (parent is not None
-                and not parent.has_auto_layout
-                and not getattr(parent, '_infer_grid', False)
-                and node.absolute_bounds):
+        _parent_no_layout = parent is not None and not parent.has_auto_layout and not getattr(parent, '_infer_grid', False)
+        _node_explicit_abs = parent is not None and node.layout_positioning == "ABSOLUTE" and not getattr(parent, '_infer_grid', False)
+        if ((_parent_no_layout or _node_explicit_abs) and node.absolute_bounds):
             parent_x = parent.absolute_bounds.get("x", 0)
             parent_y = parent.absolute_bounds.get("y", 0)
             node_x = node.absolute_bounds.get("x", 0)
@@ -1676,7 +2064,9 @@ export default function {component_name}() {{
         if getattr(node, '_infer_shrink_0', False):
             # Sidebar: full viewport height, sticks to top, scrolls its own content.
             # flex-shrink-0 keeps it at the fixed Figma width regardless of content.
+            # Remove conflicting overflow/height classes before adding our own.
             classes = [c for c in classes if not (c.startswith('h-[') or c == 'h-full')]
+            classes = [c for c in classes if c != 'overflow-hidden']  # let overflow-y-auto win
             classes.extend(['h-screen', 'sticky', 'top-0', 'overflow-y-auto', 'flex-shrink-0'])
 
         if getattr(node, '_infer_flex_one', False):
@@ -1685,18 +2075,26 @@ export default function {component_name}() {{
             classes = [c for c in classes if not (c.startswith('h-[') or c == 'h-full')]
             classes.extend(['h-screen', 'overflow-y-auto', 'flex-1', 'min-w-0'])
 
-        # Root container overflow handling (parent is None = outermost div).
+        # Root container sizing + overflow handling (parent is None = outermost div).
         if parent is None:
+            # Always strip fixed pixel sizes from the root — they make the page
+            # wider than the viewport and break all responsive layouts.
+            classes = [c for c in classes if not (c.startswith('w-[') and c.endswith('px]'))]
+            classes = [c for c in classes if not (c.startswith('h-[') and c.endswith('px]'))]
+            # Also strip any stale w-screen/h-screen left by earlier passes
+            # (the _infer_hscreen block below will re-add w-screen if needed).
+            classes = [c for c in classes if c not in ('w-screen', 'h-screen')]
+
             if getattr(node, '_infer_hscreen', False):
-                # Sidebar layout: overflow-hidden already added above — leave it.
-                # Ensure w-screen didn't get removed by an earlier class pass.
-                if 'w-screen' not in classes:
-                    classes.append('w-screen')
+                # Dashboard / sidebar layout: full viewport, no scroll.
+                classes.extend(['w-screen', 'h-screen', 'overflow-hidden'])
             else:
-                # Landing page / section-split: allow vertical scroll, block horizontal.
+                # Landing page / dashboard without inferred sidebar: scrollable, full width.
                 classes = [c for c in classes if c != 'overflow-hidden']
                 if 'w-full' not in classes:
                     classes.append('w-full')
+                if 'min-h-screen' not in classes:
+                    classes.append('min-h-screen')
                 if 'overflow-x-hidden' not in classes:
                     classes.append('overflow-x-hidden')
 
@@ -1781,22 +2179,24 @@ export default function {component_name}() {{
 
 
 class AICodeGenerator:
-    """AI-powered code generation using Groq vision model for pixel-perfect output"""
+    """AI-powered code generation using Claude vision model for pixel-perfect output"""
+
+    CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
     def __init__(self):
+        self.anthropic_client = None
         self.groq_client = None
-        self.openai_client = None
-        self.model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        self.model = "meta-llama/llama-4-scout-17b-16e-instruct"  # Groq model ID
 
-        # OpenAI (primary — higher quality, larger context)
+        # Anthropic Claude (primary — higher quality, larger context)
         try:
-            from openai import OpenAI
-            api_key = os.getenv("OPENAI_API_KEY")
+            from anthropic import Anthropic
+            api_key = os.getenv("ANTHROPIC_API_KEY")
             if api_key:
-                self.openai_client = OpenAI(api_key=api_key)
-                logger.info("AI Code Generator: OpenAI gpt-4o enabled (primary)")
+                self.anthropic_client = Anthropic(api_key=api_key)
+                logger.info(f"AI Code Generator: Anthropic {self.CLAUDE_MODEL} enabled (primary)")
         except ImportError:
-            logger.warning("AI Code Generator: openai package not installed")
+            logger.warning("AI Code Generator: anthropic package not installed — run: pip install anthropic")
 
         # Groq (fallback — fast, free)
         try:
@@ -1806,28 +2206,93 @@ class AICodeGenerator:
                 self.groq_client = Groq(api_key=api_key)
                 logger.info(
                     "AI Code Generator: Groq vision enabled"
-                    + (" (fallback)" if self.openai_client else " (primary)")
+                    + (" (fallback)" if self.anthropic_client else " (primary)")
                 )
         except ImportError:
             logger.warning("AI Code Generator: groq package not installed")
 
     @property
     def available(self):
-        return self.openai_client is not None or self.groq_client is not None
+        return self.anthropic_client is not None or self.groq_client is not None
 
-    def _call_openai(self, messages: List[Dict]) -> Optional[str]:
-        """Call OpenAI gpt-4o with the given messages. Returns raw text or None."""
+    def _call_claude(self, messages: List[Dict], max_tokens: int = 8192) -> Optional[str]:
+        """Call Claude via Anthropic API, converting OpenAI message format on the fly.
+
+        Handles:
+        - system role → top-level `system` param
+        - image_url blocks (data: URIs) → Anthropic base64 image source blocks
+        Returns raw text or None on error.
+        """
         try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                temperature=0.1,
-                max_tokens=4096,
+            system = None
+            api_messages = []
+            for msg in messages:
+                if msg["role"] == "system":
+                    system = msg["content"] if isinstance(msg["content"], str) else ""
+                else:
+                    content = msg["content"]
+                    if isinstance(content, str):
+                        api_messages.append({"role": msg["role"], "content": content})
+                    elif isinstance(content, list):
+                        anthropic_blocks = []
+                        for block in content:
+                            btype = block.get("type")
+                            if btype == "text":
+                                anthropic_blocks.append({"type": "text", "text": block["text"]})
+                            elif btype == "image_url":
+                                url = block["image_url"]["url"]
+                                if url.startswith("data:"):
+                                    # data:image/png;base64,<b64>
+                                    meta, b64 = url.split(",", 1)
+                                    media_type = meta.split(";")[0].split(":")[1]
+                                    anthropic_blocks.append({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": b64,
+                                        },
+                                    })
+                                else:
+                                    anthropic_blocks.append({
+                                        "type": "image",
+                                        "source": {"type": "url", "url": url},
+                                    })
+                        api_messages.append({"role": msg["role"], "content": anthropic_blocks})
+
+            kwargs: Dict = dict(
+                model=self.CLAUDE_MODEL,
+                max_tokens=max_tokens,
+                messages=api_messages,
             )
-            return response.choices[0].message.content
+            if system:
+                kwargs["system"] = system
+
+            response = self.anthropic_client.messages.create(**kwargs)
+            return response.content[0].text
         except Exception as e:
-            logger.error(f"OpenAI call failed: {e}")
+            logger.error(f"Claude API call failed: {e}")
             return None
+
+    @staticmethod
+    def _encode_image_for_vision(image_path: str, max_width: int = 1024) -> str:
+        """Load an image, shrink to max_width (preserving aspect ratio), return base64 PNG.
+
+        Keeping images at ≤1024px wide avoids unnecessary token spend while
+        preserving enough detail for GPT-4o to judge spacing and colours.
+        """
+        from PIL import Image
+        import io as _io
+
+        img = Image.open(image_path).convert("RGB")
+        if img.width > max_width:
+            ratio = max_width / img.width
+            img = img.resize((max_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
+
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        import base64 as _b64
+        return _b64.b64encode(buf.getvalue()).decode("utf-8")
 
     def generate_component(
         self,
@@ -1838,7 +2303,7 @@ class AICodeGenerator:
         layout_type: str = "dashboard",
     ) -> Optional[str]:
         """Generate component code using AI vision model"""
-        if not self.openai_client and not self.groq_client:
+        if not self.anthropic_client and not self.groq_client:
             return None
 
         try:
@@ -1865,31 +2330,28 @@ class AICodeGenerator:
                 }
             ]
 
-            # If screenshot available, use vision
+            # If screenshot available, use vision (resize to 1024px to save tokens)
             if figma_screenshot_path and Path(figma_screenshot_path).exists():
-                import base64
-                with open(figma_screenshot_path, "rb") as f:
-                    img_b64 = base64.b64encode(f.read()).decode()
-
+                img_b64 = self._encode_image_for_vision(figma_screenshot_path)
                 messages.append({
                     "role": "user",
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"},
                         },
-                        {"type": "text", "text": prompt}
-                    ]
+                        {"type": "text", "text": prompt},
+                    ],
                 })
             else:
                 messages.append({"role": "user", "content": prompt})
 
             logger.info(f"AI generating component: {component_name}")
-            if self.openai_client:
-                logger.info(f"  using OpenAI gpt-4o")
-                code = self._call_openai(messages)
+            if self.anthropic_client:
+                logger.info(f"  using Anthropic {self.CLAUDE_MODEL}")
+                code = self._call_claude(messages)
                 if code is None and self.groq_client:
-                    logger.warning("OpenAI failed — falling back to Groq")
+                    logger.warning("Claude failed — falling back to Groq")
                     code = self.groq_client.chat.completions.create(
                         model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
                     ).choices[0].message.content
@@ -1975,12 +2437,10 @@ class AICodeGenerator:
                     flat.append(f"  {key} → {val}")
             token_hint = "\n\nDesign tokens:\n" + "\n".join(flat) + "\n"
 
-        # Load screenshot once
+        # Load and resize screenshot once (shared across all section calls)
         img_b64: Optional[str] = None
         if figma_screenshot_path and Path(figma_screenshot_path).exists():
-            import base64
-            with open(figma_screenshot_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode()
+            img_b64 = self._encode_image_for_vision(figma_screenshot_path)
 
         enhanced_sections: List[str] = []
 
@@ -1990,21 +2450,29 @@ class AICodeGenerator:
                 f"({len(sec_code)} chars)"
             )
             prompt = (
-                f"This is section {i + 1} of {len(section_codes)} from a landing page. "
-                "Fix ONLY visual details visible in the screenshot "
-                "(gradients, shadows, border-radius, font weights). "
-                "DO NOT restructure or rename anything. "
-                "Return ONLY the corrected const arrow function — same form as input."
+                f"You are a pixel-perfect frontend developer. "
+                f"Here is the target design [see image above]. "
+                f"This is section {i + 1} of {len(section_codes)} of the page. "
+                "Fix the code to match the design EXACTLY for this section.\n\n"
+                "Rules:\n"
+                "- Use arbitrary Tailwind values for exact measurements "
+                "(gap-[13px], text-[#2D3748], w-[280px])\n"
+                "- Do not change component structure or add/remove elements\n"
+                "- Fix: spacing, padding, margins, colors, font sizes, alignment, "
+                "border radius, shadows\n"
+                "- Return ONLY the corrected const arrow function — same form as input, "
+                "no markdown fences, no explanation\n"
                 + token_hint
-                + f"\n\nSection code:\n{sec_code}"
+                + f"\nSection code:\n{sec_code}"
             )
 
             messages = [
                 {
                     "role": "system",
                     "content": (
-                        "You are a visual QA engineer. Return ONLY the corrected "
-                        "const arrow function — no markdown fences, no explanation."
+                        "You are a pixel-perfect frontend developer. "
+                        "Return ONLY the corrected const arrow function — "
+                        "no markdown fences, no explanation."
                     ),
                 }
             ]
@@ -2012,7 +2480,10 @@ class AICodeGenerator:
                 messages.append({
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"},
+                        },
                         {"type": "text", "text": prompt},
                     ],
                 })
@@ -2020,20 +2491,25 @@ class AICodeGenerator:
                 messages.append({"role": "user", "content": prompt})
 
             try:
-                resp = self.groq_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=8192,
-                )
-                enhanced_sec = resp.choices[0].message.content
-                if "```" in enhanced_sec:
+                if self.anthropic_client:
+                    enhanced_sec = self._call_claude(messages)
+                    if enhanced_sec is None and self.groq_client:
+                        logger.warning(f"Claude failed for section {i} — falling back to Groq")
+                        enhanced_sec = self.groq_client.chat.completions.create(
+                            model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                        ).choices[0].message.content
+                else:
+                    enhanced_sec = self.groq_client.chat.completions.create(
+                        model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                    ).choices[0].message.content
+
+                if enhanced_sec and "```" in enhanced_sec:
                     m = re.search(r'```(?:tsx|jsx|typescript|javascript)?\n(.*?)```', enhanced_sec, re.DOTALL)
                     if m:
                         enhanced_sec = m.group(1).strip()
-                # Validate: must still be the same section const
-                if f'const Section{i}' not in enhanced_sec:
-                    logger.warning(f"Section {i} enhancement lost const name — keeping original")
+
+                if not enhanced_sec or f'const Section{i}' not in enhanced_sec:
+                    logger.warning(f"Section {i} enhancement invalid — keeping original")
                     enhanced_sections.append(sec_code)
                 else:
                     enhanced_sections.append(enhanced_sec.strip())
@@ -2063,24 +2539,73 @@ class AICodeGenerator:
         see in the screenshot that the programmatic pass cannot produce:
         gradient backgrounds, complex shadows, missing effects, border subtleties.
         """
-        if not self.openai_client and not self.groq_client:
+        if not self.anthropic_client and not self.groq_client:
             return None
 
-        # Fix 3: for large sectioned components, enhance section-by-section so
-        # each AI call stays well within the 8192 output-token limit.
-        if len(deterministic_code) > 15000:
+        # Chunk threshold: anything over 10K chars is split and enhanced piece-by-piece.
+        # GPT-4o reliably outputs 8K-char chunks; larger inputs return unchanged code
+        # or get truncated even at max_tokens=16384.
+        _CHUNK_THRESHOLD = 10_000
+        _CHUNK_SIZE = 8_000
+
+        if len(deterministic_code) > _CHUNK_THRESHOLD:
+            # Strategy 1: landing-page Section0 pattern
             split = self._split_into_sections(deterministic_code)
             if split:
                 logger.info(
-                    f"[Section Enhance] {component_name}: "
-                    f"{len(split[1])} sections, total {len(deterministic_code)} chars"
+                    f"[AI ENHANCE] Using section-split: {len(split[1])} sections, "
+                    f"avg {len(deterministic_code) // max(len(split[1]), 1)} chars each, "
+                    f"total {len(deterministic_code)} chars"
                 )
                 result = self._enhance_by_sections(split, component_name, figma_screenshot_path, token_colors)
                 if result:
                     return result
 
+            # Strategy 2: JSX-child chunk split (dashboards and any other component)
+            logger.info(
+                f"[AI ENHANCE] Using JSX chunk-split: "
+                f"component={component_name}, code_len={len(deterministic_code)} chars"
+            )
+            result = self._enhance_by_generic_chunks(
+                deterministic_code, component_name, figma_screenshot_path,
+                token_colors, chunk_size=_CHUNK_SIZE,
+            )
+            if result:
+                return result
+
+            # Both split strategies failed. For large components skip single-pass:
+            # GPT-4o cannot meaningfully process 15K+ chars in one shot — it either
+            # echoes unchanged code or hallucinates random style changes.
+            _SINGLE_PASS_MAX = 15_000
+            if len(deterministic_code) > _SINGLE_PASS_MAX:
+                logger.info(
+                    f"[AI ENHANCE] Skipping single-pass fallback: component too large "
+                    f"({len(deterministic_code)} chars > {_SINGLE_PASS_MAX}). "
+                    f"Keeping deterministic output."
+                )
+                return None
+        else:
+            logger.info(
+                f"[AI ENHANCE] Using single-pass: "
+                f"component={component_name}, code_len={len(deterministic_code)} chars"
+            )
+
+        # ── Diagnostic: show what we're working with ─────────────────────────
+        _screenshot_status = "MISSING (no path)" if not figma_screenshot_path else (
+            f"EXISTS ({figma_screenshot_path})" if Path(figma_screenshot_path).exists()
+            else f"NOT FOUND ({figma_screenshot_path})"
+        )
+        _model_label = self.CLAUDE_MODEL if self.anthropic_client else (self.model if self.groq_client else "NONE")
+        logger.info(
+            f"[AI ENHANCE] INPUT: component={component_name}, "
+            f"code_len={len(deterministic_code)}, "
+            f"screenshot={_screenshot_status}, "
+            f"model={_model_label}"
+        )
+        logger.info(f"[AI ENHANCE] CODE PREVIEW: {deterministic_code[:200]!r}")
+
         try:
-            # Build optional token hint so AI knows what semantic names are available
+            # Build optional token colour hint
             token_hint = ""
             if token_colors:
                 flat: List[str] = []
@@ -2091,51 +2616,45 @@ class AICodeGenerator:
                     else:
                         flat.append(f"  {key} → {val}")
                 token_hint = (
-                    "\n\nDesign tokens extracted from this Figma file (available as Tailwind class names):\n"
-                    + "\n".join(flat)
-                    + "\nWhen adding NEW color classes for visual fixes, prefer the semantic token names "
-                    "(e.g. `bg-background`, `text-text-primary`, `bg-primary`) over raw hex values.\n"
+                    "\n\nDesign tokens (use these Tailwind names for new colour classes):\n"
+                    + "\n".join(flat) + "\n"
                 )
 
             enhance_prompt = (
-                "Here is programmatically generated TSX built from exact Figma measurements "
-                "(correct flex/grid structure, exact pixel sizes, exact hex colors). "
-                "Compare it against the screenshot and fix ONLY what looks visually wrong:\n"
-                "  • Gradient backgrounds (replace solid color with gradient if the screenshot shows one)\n"
-                "  • Complex drop shadows or box-shadows\n"
-                "  • Missing overlay gradients on images\n"
-                "  • Border styles or radii that differ from the screenshot\n"
-                "  • Font weight / letter-spacing / line-height mismatches\n"
-                "  • Missing visual effects (blur, opacity layers)\n\n"
-                "DO NOT change:\n"
-                "  • The flex/grid layout structure or element hierarchy\n"
-                "  • Any w-[Xpx], h-[Xpx], gap-[Xpx], p-[Xpx] classes\n"
-                "  • Any bg-[#rrggbb] or text-[#rrggbb] classes that already match the screenshot\n"
-                "  • The export default function signature\n"
+                "You are a pixel-perfect frontend developer. "
+                "Here is the target design [see image above]. "
+                "Here is the current React + Tailwind code that attempts to reproduce it. "
+                "Fix the code to match the design EXACTLY.\n\n"
+                "Rules:\n"
+                "- Use arbitrary Tailwind values for exact measurements "
+                "(gap-[13px], text-[#2D3748], w-[280px])\n"
+                "- Do not change component structure or add/remove elements\n"
+                "- Fix: spacing, padding, margins, colors, font sizes, alignment, "
+                "border radius, shadows\n"
+                "- Return ONLY the complete fixed code, no explanation\n"
                 + token_hint
-                + "\nReturn the complete corrected TSX only — no markdown fences, no explanation.\n\n"
-                f"TSX to enhance:\n{deterministic_code}"
+                + f"\nCurrent code:\n{deterministic_code}"
             )
 
             messages = [
                 {
                     "role": "system",
                     "content": (
-                        "You are a visual QA engineer for React/Tailwind code. "
-                        "You receive deterministic TSX and a Figma screenshot. "
-                        "You output ONLY corrected raw TSX — no markdown, no comments, no explanation."
+                        "You are a pixel-perfect frontend developer. "
+                        "Output ONLY raw TSX — no markdown fences, no explanation."
                     ),
                 }
             ]
 
             if figma_screenshot_path and Path(figma_screenshot_path).exists():
-                import base64
-                with open(figma_screenshot_path, "rb") as f:
-                    img_b64 = base64.b64encode(f.read()).decode()
+                img_b64 = self._encode_image_for_vision(figma_screenshot_path)
                 messages.append({
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"},
+                        },
                         {"type": "text", "text": enhance_prompt},
                     ],
                 })
@@ -2143,11 +2662,11 @@ class AICodeGenerator:
                 messages.append({"role": "user", "content": enhance_prompt})
 
             logger.info(f"🎨 [AI ENHANCE] Enhancing {component_name} visual details")
-            if self.openai_client:
-                logger.info("  using OpenAI gpt-4o")
-                enhanced = self._call_openai(messages)
+            if self.anthropic_client:
+                logger.info(f"  using Anthropic {self.CLAUDE_MODEL}")
+                enhanced = self._call_claude(messages)
                 if enhanced is None and self.groq_client:
-                    logger.warning("OpenAI failed — falling back to Groq")
+                    logger.warning("Claude failed — falling back to Groq")
                     enhanced = self.groq_client.chat.completions.create(
                         model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
                     ).choices[0].message.content
@@ -2159,6 +2678,11 @@ class AICodeGenerator:
                     model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
                 ).choices[0].message.content
 
+            logger.info(
+                f"[AI ENHANCE] RAW RESPONSE: len={len(enhanced)}, "
+                f"preview={enhanced[:200]!r}"
+            )
+
             # Strip markdown fences if present
             if "```" in enhanced:
                 match = re.search(r'```(?:tsx|jsx|typescript|javascript)?\n(.*?)```', enhanced, re.DOTALL)
@@ -2167,30 +2691,478 @@ class AICodeGenerator:
 
             # Sanity-check 1: must still have export default
             if "export default" not in enhanced:
-                logger.warning("AI enhance returned code without export default — discarding")
+                logger.warning(
+                    f"[AI ENHANCE] REJECTED: no 'export default'. "
+                    f"Last 200: {enhanced[-200:]!r}"
+                )
                 return None
 
             # Sanity-check 2: truncation guard — output must end with a closing brace.
             # If max_tokens was hit mid-output the file ends with open tags/braces,
             # which causes "Unexpected token" errors at build time.
-            if enhanced.rstrip()[-1] != '}':
-                logger.warning("AI enhance output is truncated (doesn't end with '}') — discarding")
-                return None
-
-            # Sanity-check 3: brace balance — open { must equal close }
-            if enhanced.count('{') != enhanced.count('}'):
+            _last_char = enhanced.rstrip()[-1] if enhanced.rstrip() else ""
+            if _last_char != '}':
                 logger.warning(
-                    f"AI enhance output has unbalanced braces "
-                    f"({{ {enhanced.count('{')}  }} {enhanced.count('}')}) — discarding"
+                    f"[AI ENHANCE] REJECTED: truncated (last char={_last_char!r}). "
+                    f"Last 200: {enhanced[-200:]!r}"
                 )
                 return None
 
+            # NOTE: brace-balance check removed — TSX legitimately has unequal { } counts
+            # inside string literals, template expressions, and JSX attributes.
+            # The truncation guard above is sufficient to catch incomplete output.
+
             logger.info(f"✅ [AI ENHANCE] {component_name} enhanced ({len(enhanced)} chars)")
+            logger.info(f"[AI ENHANCE] OUTPUT PREVIEW: {enhanced[:200]!r}")
             return enhanced
 
         except Exception as e:
             logger.error(f"AI enhance failed: {e}")
             return None
+
+    @staticmethod
+    def _extract_jsx_body(code: str) -> Optional[Tuple[str, str, str]]:
+        """Extract (prefix, jsx_body, suffix) from a TSX component.
+
+        prefix   = everything up to and including 'return ('
+        jsx_body = the inner JSX content between the outer return parens
+        suffix   = the closing ');\\n}' and any trailing content
+
+        Returns None if the structure can't be reliably identified.
+        """
+        # Find the LAST 'return (' — it belongs to the export default function
+        matches = list(re.finditer(r'\breturn\s*\(', code))
+        if not matches:
+            return None
+        m = matches[-1]
+        prefix = code[:m.end()]
+        rest = code[m.end():]
+
+        # Walk rest char-by-char tracking paren depth
+        depth = 1
+        i = 0
+        in_str: Optional[str] = None  # current string delimiter (' " `)
+        while i < len(rest) and depth > 0:
+            ch = rest[i]
+            if in_str:
+                if ch == "\\" and in_str != "`":
+                    i += 2  # skip escaped char
+                    continue
+                if ch == in_str:
+                    in_str = None
+            else:
+                if ch in ('"', "'", "`"):
+                    in_str = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            i += 1
+
+        if depth != 0:
+            return None  # unbalanced — bail
+
+        jsx_body = rest[:i - 1]   # everything between the outer parens
+        suffix   = rest[i - 1:]   # starts with ')'
+        return prefix, jsx_body, suffix
+
+    @staticmethod
+    def _split_jsx_fragments(jsx_body: str, chunk_size: int = 8_000) -> List[str]:
+        """Split a JSX body string into fragments ≤ chunk_size chars.
+
+        Emits a fragment whenever accumulated size ≥ chunk_size AND the current
+        line is a safe JSX close boundary (starts with '</' or is a bare closing
+        punctuation).  Guarantees at least one fragment.
+        """
+        lines = jsx_body.splitlines(keepends=True)
+        fragments: List[str] = []
+        current: List[str] = []
+        current_size = 0
+
+        def _is_close(line: str) -> bool:
+            s = line.strip()
+            return (
+                s.startswith("</")
+                or s in (")", "};", "})", ");", "}", "/>", "")
+                or s.startswith(");")
+            )
+
+        for line in lines:
+            current.append(line)
+            current_size += len(line)
+            if current_size >= chunk_size and _is_close(line):
+                fragments.append("".join(current))
+                current = []
+                current_size = 0
+
+        if current:
+            fragments.append("".join(current))
+
+        # Merge tiny tail into previous
+        if len(fragments) > 1 and len(fragments[-1]) < 300:
+            fragments[-2] += fragments[-1]
+            fragments.pop()
+
+        return fragments if fragments else [jsx_body]
+
+    @staticmethod
+    def _validate_assembled_tsx(code: str, component_name: str) -> bool:
+        """Post-assembly sanity check before accepting enhanced code.
+
+        Checks:
+          1. Exactly one 'export default'
+          2. Last non-whitespace character is '}'
+          3. JSX tag balance (open ≈ close, diff ≤ 3)
+        """
+        if code.count("export default") != 1:
+            logger.warning(
+                f"[VALIDATE] {component_name}: expected 1 'export default', "
+                f"got {code.count('export default')}"
+            )
+            return False
+
+        last = code.rstrip()[-1] if code.rstrip() else ""
+        if last != "}":
+            logger.warning(f"[VALIDATE] {component_name}: last char={last!r}, expected '}}'")
+            return False
+
+        # JSX tag balance check — strip string literals to avoid false counts
+        stripped = re.sub(r'"[^"]*"|\'[^\']*\'|`[^`]*`', '""', code)
+        # All opening-like tags: <Tag or <Tag ... >
+        all_open   = len(re.findall(r'<[A-Za-z][A-Za-z0-9.]*(?:\s[^>]*)?>', stripped))
+        # Self-closing tags: <Tag /> or <Tag .../>  (these match all_open but have no close tag)
+        self_close = len(re.findall(r'<[A-Za-z][A-Za-z0-9.]*(?:\s[^>]*)?/>', stripped))
+        open_tags  = all_open - self_close  # real opening tags that need a closing tag
+        close_tags = len(re.findall(r'</[A-Za-z]', stripped))
+        diff = abs(open_tags - close_tags)
+        total_tags = open_tags + close_tags + self_close
+        threshold  = max(5, int(total_tags * 0.03))
+        logger.info(
+            f"[VALIDATE] {component_name}: open={open_tags} "
+            f"(self-closing={self_close}), close={close_tags}, "
+            f"adjusted_diff={diff}, threshold={threshold}"
+        )
+        if diff > threshold:
+            logger.warning(
+                f"[VALIDATE] {component_name}: JSX tag imbalance "
+                f"(open={open_tags}, close={close_tags}, diff={diff} > threshold={threshold})"
+            )
+            return False
+
+        return True
+
+    # Keep for use by self_healer.py (imported there)
+    @staticmethod
+    def _split_code_into_chunks(code: str, chunk_size: int = 8_000) -> List[str]:
+        """Legacy splitter — splits raw code at close-tag boundaries.
+        Only used internally as fallback; prefer _extract_jsx_body + _split_jsx_fragments.
+        """
+        lines = code.splitlines(keepends=True)
+        chunks: List[str] = []
+        current: List[str] = []
+        current_size = 0
+
+        def _is_close_boundary(line: str) -> bool:
+            s = line.strip()
+            return (
+                s.startswith("</")
+                or s in (")", "};", "})", ");", "}", "/>")
+                or s.startswith(");")
+            )
+
+        for line in lines:
+            current.append(line)
+            current_size += len(line)
+            if current_size >= chunk_size and _is_close_boundary(line):
+                chunks.append("".join(current))
+                current = []
+                current_size = 0
+
+        if current:
+            chunks.append("".join(current))
+
+        if len(chunks) > 1 and len(chunks[-1]) < 500:
+            chunks[-2] += chunks[-1]
+            chunks.pop()
+
+        return chunks if chunks else [code]
+
+    def _enhance_by_generic_chunks(
+        self,
+        code: str,
+        component_name: str,
+        figma_screenshot_path: Optional[str],
+        token_colors: Optional[Dict],
+        chunk_size: int = 8_000,
+    ) -> Optional[str]:
+        """Enhance an oversized component by:
+        1. Extracting the inner JSX body from 'return (...)'
+        2. Splitting the body into JSX fragments ≤ chunk_size chars
+        3. Sending each fragment to GPT-4o with a clear 'fragment, not component' prompt
+        4. Reassembling prefix + enhanced fragments + suffix
+        5. Validating the assembled result before returning
+
+        This avoids the bug where GPT-4o wraps each chunk in its own component,
+        producing multiple orphaned export-default functions when concatenated.
+        """
+        extracted = self._extract_jsx_body(code)
+        if extracted is None:
+            logger.warning(
+                f"[AI ENHANCE] Cannot extract JSX body for {component_name} — skipping chunk enhancement"
+            )
+            return None
+
+        prefix, jsx_body, suffix = extracted
+
+        # Diagnostic: log the exact prefix so we can see what 'return (' looks like
+        logger.info(
+            f"[AI ENHANCE] Prefix tail (last 120 chars): {prefix[-120:]!r}"
+        )
+
+        fragments = self._split_jsx_fragments(jsx_body, chunk_size)
+
+        logger.info(
+            f"[AI ENHANCE] Fragment-split: {len(fragments)} fragments, "
+            f"sizes={[len(f) for f in fragments]}"
+        )
+
+        # Load screenshot once
+        img_b64: Optional[str] = None
+        if figma_screenshot_path and Path(figma_screenshot_path).exists():
+            img_b64 = self._encode_image_for_vision(figma_screenshot_path)
+
+        token_hint = ""
+        if token_colors:
+            flat: List[str] = []
+            for key, val in token_colors.items():
+                if isinstance(val, dict):
+                    for k, v in val.items():
+                        flat.append(f"  {key}.{k} → {v}")
+                else:
+                    flat.append(f"  {key} → {val}")
+            token_hint = "\n\nDesign tokens:\n" + "\n".join(flat) + "\n"
+
+        enhanced_fragments: List[str] = []
+        for i, frag in enumerate(fragments):
+            logger.info(f"[AI ENHANCE] Fragment {i + 1}/{len(fragments)} ({len(frag)} chars)")
+
+            prompt = (
+                "You are a pixel-perfect frontend developer.\n"
+                + ("The target design is in the image above.\n" if img_b64 else "")
+                + f"This is JSX fragment {i + 1} of {len(fragments)} from component '{component_name}'.\n\n"
+                "CRITICAL: This is a RAW JSX FRAGMENT — NOT a complete React component.\n"
+                "DO NOT add 'export default', 'function', 'const', 'return', or any wrapper.\n\n"
+                "STRICT RULES:\n"
+                "1. PRESERVE all colors, backgrounds, and values that already match the design. "
+                "If a style value is not visibly wrong, DO NOT change it. When in doubt, keep the original.\n"
+                "2. Do NOT add or remove JSX elements — keep the exact same element tree.\n"
+                "3. Do NOT restructure or rewrite JSX — only change className strings.\n"
+                "4. Use arbitrary Tailwind values for fixes: gap-[13px], w-[280px], text-[#2D3748].\n"
+                "5. Return ONLY the corrected JSX fragment — no markdown fences, no explanation.\n"
+                + token_hint
+                + f"\nJSX fragment to improve:\n{frag}"
+            )
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You output ONLY raw JSX fragments. "
+                        "Never wrap output in a function, export, or component declaration. "
+                        "No markdown fences, no explanation."
+                    ),
+                }
+            ]
+            if img_b64:
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                })
+            else:
+                messages.append({"role": "user", "content": prompt})
+
+            try:
+                if self.anthropic_client:
+                    enhanced_frag = self._call_claude(messages)
+                    if enhanced_frag is None and self.groq_client:
+                        enhanced_frag = self.groq_client.chat.completions.create(
+                            model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                        ).choices[0].message.content
+                else:
+                    enhanced_frag = self.groq_client.chat.completions.create(
+                        model=self.model, messages=messages, temperature=0.1, max_tokens=8192,
+                    ).choices[0].message.content
+
+                if enhanced_frag and "```" in enhanced_frag:
+                    m = re.search(r'```(?:tsx|jsx|typescript|javascript|html)?\n(.*?)```', enhanced_frag, re.DOTALL)
+                    if m:
+                        enhanced_frag = m.group(1)
+
+                # Reject if GPT-4o wrapped output in a component anyway
+                if enhanced_frag and "export default" in enhanced_frag:
+                    logger.warning(
+                        f"[AI ENHANCE] Fragment {i + 1}: AI wrapped output in component — "
+                        "keeping original fragment"
+                    )
+                    enhanced_fragments.append(frag)
+                elif not enhanced_frag or not enhanced_frag.strip():
+                    logger.warning(f"[AI ENHANCE] Fragment {i + 1}: empty response — keeping original")
+                    enhanced_fragments.append(frag)
+                else:
+                    enhanced_fragments.append(enhanced_frag)
+
+            except Exception as e:
+                logger.warning(f"[AI ENHANCE] Fragment {i + 1} failed: {e} — keeping original")
+                enhanced_fragments.append(frag)
+
+        # Reassemble: prefix + enhanced body + suffix
+        enhanced_body = "".join(enhanced_fragments)
+        result = prefix + enhanced_body + suffix
+
+        # ── Post-processing ────────────────────────────────────────────────────
+        # 1. Fix whitespace: ensure 'return (' is followed by a newline, not spaces.
+        result = re.sub(r'(return\s*\()[ \t]+(<)', r'\1\n    \2', result)
+
+        # 2. Restore root className + hex colors from the original.
+        result = self._restore_root_classname(code, result, component_name)
+
+        # Diagnostic: log first 20 lines so we can see actual output
+        first_20 = "\n".join(result.splitlines()[:20])
+        logger.info(f"[AI ENHANCE] First 20 lines of assembled result:\n{first_20}")
+
+        # 3. Tag-balance sanity check
+        if not self._validate_assembled_tsx(result, component_name):
+            logger.warning(f"[AI ENHANCE] Tag validation failed — keeping deterministic output")
+            return None
+
+        # 4. SWC syntax check — compile the assembled TSX in a temp file.
+        #    If it fails, fall back to deterministic code (always compiles).
+        syntax_ok = self._check_tsx_syntax(result, component_name)
+        if not syntax_ok:
+            logger.warning(
+                f"[AI ENHANCE] SWC syntax check failed — keeping deterministic output "
+                f"(component={component_name})"
+            )
+            return None
+
+        logger.info(f"[AI ENHANCE] Fragment reassembly OK: {len(result)} chars")
+        return result
+
+    @staticmethod
+    def _restore_root_classname(original: str, enhanced: str, component_name: str) -> str:
+        """Restore the root div's className from the original deterministic code.
+
+        The root className carries layout (w-screen h-screen flex-row) and
+        background colors that GPT-4o commonly corrupts when it only sees an
+        inner fragment.  We always keep the original root classes verbatim.
+
+        Also scans for any hex color utility (`bg-[#...]`, `text-[#...]`, etc.)
+        that appears in the enhanced code but NOT in the original and replaces it
+        with the most similar original color.  This catches cases where AI
+        changes non-root colors without a design justification.
+        """
+        # ── Step 1: Restore root div className ────────────────────────────────
+        root_pat = re.compile(r'(<div\b[^>]*?\bclassName=")([^"]+)(")')
+        orig_root = root_pat.search(original)
+        if orig_root:
+            orig_root_classes = orig_root.group(2)
+            _first = [True]
+
+            def _restore_first(m):
+                if _first[0]:
+                    _first[0] = False
+                    if m.group(2) != orig_root_classes:
+                        logger.info(
+                            f"[COLOR RESTORE] {component_name}: root className restored "
+                            f"({m.group(2)[:60]!r} → {orig_root_classes[:60]!r})"
+                        )
+                    return f"{m.group(1)}{orig_root_classes}{m.group(3)}"
+                return m.group(0)
+
+            enhanced = root_pat.sub(_restore_first, enhanced)
+
+        # ── Step 2: Restore any hex color utility not present in original ─────
+        color_util_pat = re.compile(
+            r'\b(bg|text|border|from|to|via|ring|shadow|outline|fill|stroke)'
+            r'-\[(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\))\]'
+        )
+        orig_colors  = set(color_util_pat.findall(original))   # {(prefix, value), ...}
+        orig_hex_set = {v for _, v in orig_colors}             # set of original hex values
+
+        def _restore_color(m: re.Match) -> str:
+            prefix_cls, color_val = m.group(1), m.group(2)
+            if (prefix_cls, color_val) in orig_colors:
+                return m.group(0)  # present in original — keep
+            if color_val in orig_hex_set:
+                return m.group(0)  # same hex used in original (different util) — keep
+            # Totally new color: revert to the first original color with same prefix
+            fallback_colors = [v for p, v in orig_colors if p == prefix_cls]
+            if fallback_colors:
+                repl = f"{prefix_cls}-[{fallback_colors[0]}]"
+                logger.info(
+                    f"[COLOR RESTORE] {component_name}: {m.group(0)!r} → {repl!r} "
+                    "(not in original, reverting)"
+                )
+                return repl
+            return m.group(0)
+
+        enhanced = color_util_pat.sub(_restore_color, enhanced)
+        return enhanced
+
+    @staticmethod
+    def _check_tsx_syntax(code: str, component_name: str) -> bool:
+        """Verify TSX syntax using bracket/tag balance check.
+
+        SWC is not required — the bracket balance check catches the most
+        common failure modes (unbalanced parens, fragment boundary breaks).
+        """
+        return AICodeGenerator._bracket_balance_check(code, component_name)
+
+    @staticmethod
+    def _bracket_balance_check(code: str, component_name: str) -> bool:
+        """Lightweight fallback: verify paren and angle-bracket balance.
+
+        Not a full parser, but catches the most common fragment-boundary errors
+        (unclosed tags, runaway JSX expressions) that SWC would reject.
+        """
+        # Paren balance (covers 'return ( ... )' wrapping)
+        paren_depth = 0
+        in_str: Optional[str] = None
+        for ch in code:
+            if in_str:
+                if ch == in_str:
+                    in_str = None
+            else:
+                if ch in ('"', "'", '`'):
+                    in_str = ch
+                elif ch == '(':
+                    paren_depth += 1
+                elif ch == ')':
+                    paren_depth -= 1
+
+        if paren_depth != 0:
+            logger.warning(
+                f"[BRACKET CHECK] {component_name}: paren imbalance "
+                f"(depth={paren_depth} at end)"
+            )
+            return False
+
+        # Angle-bracket balance (very rough — only catches gross mismatches)
+        stripped = re.sub(r'"[^"]*"|\'[^\']*\'|`[^`]*`', '""', code)
+        opens  = len(re.findall(r'<[A-Za-z]', stripped))
+        closes = len(re.findall(r'(?:</[A-Za-z]|/>)', stripped))
+        if abs(opens - closes) > max(5, opens * 0.05):
+            logger.warning(
+                f"[BRACKET CHECK] {component_name}: angle-bracket imbalance "
+                f"(opens={opens}, closes={closes})"
+            )
+            return False
+
+        logger.info(f"[BRACKET CHECK] {component_name}: OK (paren=0, opens={opens}, closes={closes})")
+        return True
 
     def _simplify_node(self, node: FigmaNode, image_map: Dict, depth: int = 0) -> Dict:
         """Create simplified node structure with full CSS properties for AI prompt"""
@@ -2557,55 +3529,187 @@ class ProductionFigmaToCode:
             self.mcp_client = None
     
     async def _export_frame_image(self, file_id: str, node_id: str, output_dir: Path) -> Optional[str]:
-        """Export a specific Figma frame as PNG using the images API.
+        """Get a PNG screenshot of a Figma frame using a 4-source fallback chain.
 
-        Caches the result so repeated runs don't re-hit the API.
-        Returns the local file path, or None if export fails.
+        Sources tried in order (fastest/cheapest first):
+          a) Persistent cross-run cache  → instant, zero API calls
+          b) Figma images/render API     → highest quality, subject to 429
+          c) Playwright embed screenshot → no API, works for shared files
+          d) Returns None               → caller falls back to file thumbnail
+
+        Successful results from b/c are stored in the persistent cache so
+        subsequent runs skip all API calls.
         """
-        safe_id = node_id.replace(":", "_").replace(";", "_")
-        cache_path = output_dir / f"_frame_{safe_id}.png"
+        import shutil as _shutil
+        safe_id = node_id.replace("-", "_").replace(":", "_").replace(";", "_")
 
-        # Return cached file if valid
-        if cache_path.exists() and cache_path.stat().st_size > 10_000:
-            logger.info(f"Using cached frame screenshot: {cache_path.name}")
-            return str(cache_path)
+        # Shared paths
+        persistent_cache_dir = ImageDownloader.PERSISTENT_CACHE_ROOT / file_id
+        persistent_cache_dir.mkdir(parents=True, exist_ok=True)
+        persistent_path = persistent_cache_dir / f"frame_{safe_id}.png"
+        local_path = output_dir / f"_frame_{safe_id}.png"
+
+        def _save_and_cache(data: bytes) -> str:
+            """Write to both local and persistent cache, return local path string."""
+            local_path.write_bytes(data)
+            try:
+                persistent_path.write_bytes(data)
+            except Exception:
+                pass
+            return str(local_path)
+
+        # ── a) Persistent cache ───────────────────────────────────────────────
+        if persistent_path.exists():
+            _cached_size = persistent_path.stat().st_size
+            if _cached_size < 100_000:
+                logger.warning(f"[FRAME] a) Cached screenshot too small ({_cached_size // 1024}KB) — likely a thumbnail, deleting and re-downloading")
+                persistent_path.unlink()
+            else:
+                logger.info(f"[FRAME] a) Persistent cache hit: {persistent_path.name} ({_cached_size // 1024}KB)")
+                _shutil.copy2(str(persistent_path), str(local_path))
+                return str(local_path)
+
+        if local_path.exists() and local_path.stat().st_size >= 100_000:
+            logger.info(f"[FRAME] a) Project cache hit: {local_path.name} ({local_path.stat().st_size // 1024}KB)")
+            return str(local_path)
+
+        # ── b) Figma images/render API ────────────────────────────────────────
+        logger.info(f"[FRAME] b) Trying Figma render API for node {node_id}…")
+        try:
+            await asyncio.sleep(5)  # avoid hitting same bucket as node-image downloads
+
+            headers = {"X-Figma-Token": self.figma_token.strip()}
+            loop = asyncio.get_event_loop()
+
+            def _render_api_call():
+                r = requests.get(
+                    f"{self.api_base}/images/{file_id}",
+                    headers=headers,
+                    params={"ids": node_id, "format": "png", "scale": "2"},
+                    timeout=30,
+                )
+                if r.status_code == 429:
+                    logger.warning(f"[FRAME] b) 429 — waiting 30s and retrying")
+                    time.sleep(30)
+                    r = requests.get(
+                        f"{self.api_base}/images/{file_id}",
+                        headers=headers,
+                        params={"ids": node_id, "format": "png", "scale": "2"},
+                        timeout=30,
+                    )
+                return r
+
+            resp = await loop.run_in_executor(None, _render_api_call)
+
+            if resp.status_code == 200:
+                image_url = resp.json().get("images", {}).get(node_id)
+                if image_url:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                            if r.status == 200:
+                                data = await r.read()
+                                if len(data) > 10_000:
+                                    path = _save_and_cache(data)
+                                    logger.info(f"[FRAME] b) Render API success: {len(data) // 1024}KB")
+                                    return path
+            else:
+                logger.warning(f"[FRAME] b) Render API returned {resp.status_code} — trying Playwright")
+        except Exception as e:
+            logger.warning(f"[FRAME] b) Render API failed: {e} — trying Playwright")
+
+        # ── c) Playwright embed screenshot ────────────────────────────────────
+        logger.info(f"[FRAME] c) Trying Playwright embed screenshot…")
+        playwright_result = await self._screenshot_figma_via_playwright(
+            file_id=file_id,
+            node_id=node_id,
+            output_path=local_path,
+        )
+        if playwright_result and local_path.exists() and local_path.stat().st_size > 10_000:
+            try:
+                persistent_path.write_bytes(local_path.read_bytes())
+            except Exception:
+                pass
+            logger.info(f"[FRAME] c) Playwright success: {local_path.stat().st_size // 1024}KB")
+            return str(local_path)
+
+        # ── d) No source available ────────────────────────────────────────────
+        logger.warning(f"[FRAME] All screenshot sources failed for node {node_id} — caller will use thumbnail")
+        return None
+
+    async def _screenshot_figma_via_playwright(
+        self,
+        file_id: str,
+        node_id: str,
+        output_path: Path,
+        width: int = 1920,
+    ) -> bool:
+        """Take a screenshot of a Figma design using Playwright (headless Chromium).
+
+        Uses the public embed URL so no Figma session/cookies are required for
+        files with link sharing enabled.  Returns True on success.
+        """
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("[FRAME] playwright not installed — run: pip install playwright && playwright install chromium")
+            return False
+
+        # Construct embed URL — works for files with "Anyone with the link" sharing
+        node_id_enc = node_id.replace(":", "%3A").replace("+", "%2B")
+        figma_design_url = f"https://www.figma.com/design/{file_id}?node-id={node_id_enc}"
+        from urllib.parse import quote as _quote
+        embed_url = f"https://www.figma.com/embed?embed_host=share&url={_quote(figma_design_url, safe='')}"
+
+        logger.info(f"[FRAME] Playwright: opening {embed_url[:80]}…")
 
         try:
-            headers = {"X-Figma-Token": self.figma_token.strip()}
-            resp = requests.get(
-                f"{self.api_base}/images/{file_id}",
-                headers=headers,
-                params={"ids": node_id, "format": "png", "scale": "1"},
-                timeout=30,
-            )
-            if resp.status_code != 200:
-                logger.warning(f"Figma images API returned {resp.status_code} for frame {node_id}")
-                return None
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                ctx = await browser.new_context(
+                    viewport={"width": width, "height": 1080},
+                    device_scale_factor=1,
+                )
+                page = await ctx.new_page()
 
-            image_url = resp.json().get("images", {}).get(node_id)
-            if not image_url:
-                logger.warning(f"No image URL returned for frame {node_id}")
-                return None
+                # Navigate; use domcontentloaded (faster) then poll for canvas
+                await page.goto(embed_url, wait_until="domcontentloaded", timeout=30_000)
 
-            # Download the rendered frame PNG from S3
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    image_url, timeout=aiohttp.ClientTimeout(total=60)
-                ) as r:
-                    if r.status == 200:
-                        data = await r.read()
-                        if len(data) > 1000:
-                            cache_path.write_bytes(data)
-                            logger.info(
-                                f"Frame screenshot exported: {cache_path.name} "
-                                f"({len(data) // 1024}KB)"
-                            )
-                            return str(cache_path)
-                    logger.warning(f"Frame image download failed: HTTP {r.status}")
+                # Wait for Figma canvas — try several known selectors
+                canvas_loaded = False
+                for selector in [
+                    '[data-testid="canvas-container"]',
+                    'canvas',
+                    '.figma-embed',
+                    '[class*="canvas"]',
+                ]:
+                    try:
+                        await page.wait_for_selector(selector, timeout=12_000)
+                        canvas_loaded = True
+                        logger.info(f"[FRAME] Playwright: canvas found via '{selector}'")
+                        break
+                    except Exception:
+                        continue
+
+                if not canvas_loaded:
+                    # Fallback: just wait for the page to settle
+                    logger.info("[FRAME] Playwright: canvas selector not found — waiting 10s")
+                    await page.wait_for_timeout(10_000)
+
+                # Extra settle time for Figma to finish rendering layers
+                await page.wait_for_timeout(3_000)
+
+                await page.screenshot(path=str(output_path), full_page=False)
+                await browser.close()
+
+            if output_path.exists() and output_path.stat().st_size > 10_000:
+                return True
+
+            logger.warning("[FRAME] Playwright: screenshot file too small — likely a login/error page")
+            return False
+
         except Exception as e:
-            logger.warning(f"Could not export frame image for {node_id}: {e}")
-
-        return None
+            logger.warning(f"[FRAME] Playwright screenshot failed: {e}")
+            return False
 
     async def convert(self, figma_url: str, output_dir: Path, figma_screenshot_path: str = None) -> Dict:
         """Convert Figma to production-ready code"""
@@ -2722,6 +3826,9 @@ class ProductionFigmaToCode:
             # Set USE_AI=false to force programmatic-only mode (faster, lower quality).
             use_ai = os.getenv('USE_AI', 'true').lower() == 'true'
             logger.info(f"🔧 Code generation mode: {'AI (pixel-perfect)' if use_ai else 'PROGRAMMATIC'}")
+            use_decompose = os.getenv('DECOMPOSE', 'false').lower() == 'true'
+            if use_decompose:
+                logger.info("🧩 Decomposed pipeline enabled (DECOMPOSE=true)")
 
             generated = []
             for frame in frames:
@@ -2739,6 +3846,20 @@ class ProductionFigmaToCode:
                     logger.info(f"Using file thumbnail as fallback for AI")
                 else:
                     logger.warning(f"No screenshot available for AI — quality may be reduced")
+
+                # ——— Decomposed pipeline (DECOMPOSE=true): generate each semantic
+                # component independently then compose a page layout. Falls back to
+                # the monolithic path if decomposition produces no specs.
+                if use_decompose and use_ai and self.ai_generator.available:
+                    logger.info(f"🧩 [DECOMPOSE] Breaking {comp_name} into components")
+                    _decomp = self._convert_decomposed(
+                        frame, comp_name, _ai_screenshot_path,
+                        output_dir, image_map, components_dir,
+                    )
+                    if _decomp:
+                        generated.extend(_decomp)
+                        continue  # skip monolithic path for this frame
+                    logger.warning(f"[DECOMPOSE] Fell back to monolithic pipeline for {comp_name}")
 
                 # Detect layout type BEFORE generating code so we choose the right strategy.
                 # A landing page is: taller-than-wide AND no sidebar+content child pattern.
@@ -2826,13 +3947,16 @@ class ProductionFigmaToCode:
 
             logger.info("🎉 Conversion complete!")
 
+            first_frame = frames[0] if frames else None
             return {
                 "success": True,
                 "components": generated,
                 "images": len(image_map),
                 "output_dir": str(output_dir),
                 "file_name": figma_data.get("name", "Untitled"),
-                "first_frame_node_id": frames[0].id if frames else None,
+                "first_frame_node_id": first_frame.id if first_frame else None,
+                "frame_width": int(first_frame.width) if first_frame else None,
+                "frame_height": int(first_frame.height) if first_frame else None,
                 "thumbnail_url": figma_data.get("thumbnailUrl"),  # Pre-generated, no extra API call
                 "registry_path": str(registry_path),
             }
@@ -2844,6 +3968,507 @@ class ProductionFigmaToCode:
                 "error": str(e)
             }
     
+    # ──────────────────────────────────────────────────────────────────────────
+    # Decomposed pipeline
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _convert_decomposed(
+        self,
+        frame,               # FigmaNode
+        comp_name: str,
+        frame_screenshot_path: Optional[str],
+        output_dir: Path,
+        image_map: Dict[str, str],
+        components_dir: Path,
+    ) -> List[Dict]:
+        """
+        Decompose *frame* into semantic components, generate each independently
+        with Claude (cropped screenshot + structured node description), then emit
+        a page layout component that imports and composes them.
+
+        Returns a list with one entry — the page layout — so that
+        _generate_nextjs_structure writes a clean page.tsx importing one root
+        component.  Returns [] on total failure so the caller falls back.
+        """
+        try:
+            from tools.component_decomposer import ComponentDecomposer
+        except ImportError:
+            try:
+                from component_decomposer import ComponentDecomposer
+            except ImportError:
+                logger.error("[DECOMPOSE] component_decomposer not found — falling back")
+                return []
+
+        decomposer = ComponentDecomposer()
+        specs = decomposer.decompose(frame)
+
+        if not specs:
+            logger.warning(f"[DECOMPOSE] No specs for {comp_name} — falling back")
+            return []
+
+        spec_summary = [
+            f"{s.name}(×{s.instance_count})" if s.is_template else s.name
+            for s in specs
+        ]
+        logger.info(f"[DECOMPOSE] {comp_name} → {len(specs)} components: [{', '.join(spec_summary)}]")
+
+        # ── Load frame screenshot for cropping ───────────────────────────────
+        frame_img = None
+        img_w = img_h = 0
+        if frame_screenshot_path and Path(frame_screenshot_path).exists():
+            try:
+                from PIL import Image as _PILImage
+                frame_img = _PILImage.open(frame_screenshot_path)
+                img_w, img_h = frame_img.size
+                logger.info(f"[DECOMPOSE] Frame screenshot loaded: {img_w}×{img_h}")
+            except Exception as _e:
+                logger.warning(f"[DECOMPOSE] Could not load frame screenshot: {_e}")
+
+        # Scale factor: Figma design px → screenshot px
+        scale_x = img_w / max(frame.width, 1) if frame_img else 1.0
+        scale_y = img_h / max(frame.height, 1) if frame_img else 1.0
+
+        crops_dir = output_dir / "_crops"
+        crops_dir.mkdir(exist_ok=True)
+
+        # ── Sanitize all component names before any file I/O ─────────────────
+        # Strip every non-alphanumeric character (commas, dots, spaces, etc.)
+        # and ensure the name starts with an uppercase letter.
+        for spec in specs:
+            spec.name = re.sub(r'[^a-zA-Z0-9]', '', spec.name)
+            if spec.name and not spec.name[0].isupper():
+                spec.name = spec.name[0].upper() + spec.name[1:]
+            if not spec.name:
+                spec.name = "Component"
+
+        # ── Generate each component ──────────────────────────────────────────
+        generated_specs: List[Dict] = []
+        for spec in specs:
+            # 1. Crop the frame screenshot to this component's bounding box
+            cropped_path: Optional[str] = None
+            if frame_img is not None:
+                try:
+                    x, y, w, h = spec.crop_box
+                    sx = int(x * scale_x);  sy = int(y * scale_y)
+                    sw = max(1, int(w * scale_x));  sh = max(1, int(h * scale_y))
+                    sx = min(sx, img_w - 1);  sy = min(sy, img_h - 1)
+                    sw = min(sw, img_w - sx);  sh = min(sh, img_h - sy)
+                    if sw > 0 and sh > 0:
+                        cropped = frame_img.crop((sx, sy, sx + sw, sy + sh))
+                        crop_file = crops_dir / f"{spec.name}_crop.png"
+                        cropped.save(str(crop_file))
+                        cropped_path = str(crop_file)
+                except Exception as _e:
+                    logger.warning(f"[DECOMPOSE] Crop failed for {spec.name}: {_e}")
+
+            # 2. Generate via Claude — with retry and programmatic fallback
+            code = self._generate_decomposed_component(spec, cropped_path, image_map)
+            if not code:
+                logger.warning(f"[DECOMPOSE] No code for {spec.name} — using programmatic fallback")
+                code = self.code_generator.generate_component(spec.node, spec.name, image_map)
+
+            # 3. Bracket/syntax validation — retry once on failure, then programmatic fallback
+            code = re.sub(r'(return\s*\()[ \t]+(<)', r'\1\n    \2', code)
+            if not AICodeGenerator._bracket_balance_check(code, spec.name):
+                logger.warning(f"[DECOMPOSE] {spec.name}: bracket check failed — retrying with stricter prompt")
+                retry_code = self._generate_decomposed_component(
+                    spec, cropped_path, image_map,
+                    extra_instruction=(
+                        "\n\nCRITICAL: Your previous response had syntax errors. "
+                        "Return ONLY valid TSX code. Ensure ALL tags are closed, "
+                        "ALL parentheses are balanced, and the code compiles without errors."
+                    ),
+                )
+                if retry_code and AICodeGenerator._bracket_balance_check(retry_code, spec.name):
+                    code = re.sub(r'(return\s*\()[ \t]+(<)', r'\1\n    \2', retry_code)
+                    logger.info(f"[DECOMPOSE] {spec.name}: retry succeeded")
+                else:
+                    logger.warning(f"[DECOMPOSE] {spec.name}: retry also failed — using programmatic fallback")
+                    code = self.code_generator.generate_component(spec.node, spec.name, image_map)
+
+            # 4. Save
+            comp_file = components_dir / f"{spec.name}.tsx"
+            comp_file.write_text(code, encoding="utf-8")
+            logger.info(f"[DECOMPOSE] ✅ {spec.name}.tsx ({len(code)} chars)")
+            generated_specs.append({"name": spec.name, "file": str(comp_file), "spec": spec})
+
+        if not generated_specs:
+            logger.warning(f"[DECOMPOSE] All generations failed for {comp_name}")
+            return []
+
+        # ── Page layout ──────────────────────────────────────────────────────
+        page_name = f"{comp_name}Page"
+        page_code = self._generate_decomposed_page_layout(page_name, specs, generated_specs, frame)
+        page_file = components_dir / f"{page_name}.tsx"
+        page_file.write_text(page_code, encoding="utf-8")
+        logger.info(f"[DECOMPOSE] ✅ Page layout: {page_name}.tsx")
+
+        # ── Full build check ─────────────────────────────────────────────────
+        logger.info(f"[DECOMPOSE] Running next build to verify generated code…")
+        try:
+            build_result = subprocess.run(
+                ["npx", "next", "build"],
+                cwd=str(output_dir),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if build_result.returncode != 0:
+                tail = (build_result.stdout + build_result.stderr)[-800:]
+                logger.warning(f"[DECOMPOSE] Build FAILED — falling back to monolithic pipeline\n{tail}")
+                return []  # triggers monolithic fallback in convert()
+            logger.info(f"[DECOMPOSE] ✅ Build passed")
+        except subprocess.TimeoutExpired:
+            logger.warning("[DECOMPOSE] Build timed out — proceeding anyway (assume OK)")
+        except Exception as _build_err:
+            logger.warning(f"[DECOMPOSE] Build check error: {_build_err} — proceeding anyway")
+
+        return [{
+            "name": page_name,
+            "file": str(page_file),
+            "original": frame.name,
+            "node_id": frame.id,
+            "node_type": frame.type,
+        }]
+
+    def _generate_decomposed_component(
+        self,
+        spec,                           # ComponentSpec
+        cropped_path: Optional[str],
+        image_map: Dict[str, str],
+        extra_instruction: str = "",    # appended on retry
+    ) -> Optional[str]:
+        """Call Claude with a cropped screenshot + structured description to generate one component."""
+        if not self.ai_generator.anthropic_client and not self.ai_generator.groq_client:
+            return None
+
+        system_text = (
+            "You are a pixel-perfect React + Tailwind CSS developer. "
+            "Convert the Figma component to a TypeScript React component.\n\n"
+            "RULES:\n"
+            "- Output ONLY raw TSX — no markdown fences, no explanations\n"
+            f"- The function MUST be named EXACTLY: {spec.name} (case-sensitive)\n"
+            "- Tailwind CSS classes; for non-standard values use arbitrary: w-[340px], text-[13px]\n"
+            "- Next.js <Image> for images (import Image from 'next/image'; width+height required)\n"
+            "- Match the screenshot exactly: colors, spacing, typography, borders, shadows\n"
+            "- Use exact hex colors from the node description\n"
+            "- Escape { } inside JSX text with &#123; &#125;\n"
+            "- ALL tags must be properly closed; ALL parentheses must be balanced"
+        )
+
+        tree_description = self._describe_node_for_prompt(spec.node, image_map)
+        text_content = self._collect_text_content(spec.node)
+        image_refs = self._collect_image_refs(spec.node, image_map)
+
+        w = int(spec.node.width)
+        h = int(spec.node.height)
+        text_block = "\n".join(f'  "{t}"' for t in text_content[:30]) if text_content else "  (none)"
+        image_block = "\n".join(f"  {r}" for r in image_refs[:10]) if image_refs else "  (none)"
+
+        template_section = ""
+        if spec.is_template and spec.instances:
+            varying = "\n".join(f"  {k}: {repr(v)}" for k, v in list(spec.instances[0].items())[:10])
+            template_section = (
+                f"\nTEMPLATE: rendered ×{spec.instance_count}. "
+                f"Define a TypeScript props interface for these varying fields:\n{varying}\n"
+            )
+
+        prompt_text = f"""Convert this Figma component to a React + Tailwind component.
+
+COMPONENT TREE:
+{tree_description}
+
+ALL TEXT CONTENT (use exactly these strings):
+{text_block}
+
+IMAGE REFERENCES (use these exact paths):
+{image_block}
+{template_section}
+RULES:
+- Use exact pixel values from the tree: w-[{w}px], h-[{h}px]
+- Use arbitrary Tailwind values: bg-[#1c1442], text-[14px], rounded-[10px], gap-[8px]
+- Every TEXT node must appear in the output with its exact content
+- Every IMAGE node must render as <img src="{{path}}" className="w-full h-full object-cover" alt="" />
+- Use flex-row for HORIZONTAL layout, flex-col for VERTICAL
+- Nodes without layoutMode use relative/absolute positioning
+- Include ALL children shown in the tree, not just top-level ones
+- The export MUST be exactly: export default function {spec.name}() (name is case-sensitive)
+- Return ONLY the code, no markdown fences, no explanation{extra_instruction}"""
+
+        # User message: text + optional screenshot crop
+        user_content: List[Dict] = [{"type": "text", "text": prompt_text}]
+        if cropped_path and Path(cropped_path).exists():
+            try:
+                import base64 as _b64
+                b64 = _b64.b64encode(Path(cropped_path).read_bytes()).decode()
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                })
+                user_content.append({
+                    "type": "text",
+                    "text": "Replicate the component shown in the image precisely.",
+                })
+            except Exception as _e:
+                logger.warning(f"[DECOMPOSE] Could not encode crop for {spec.name}: {_e}")
+
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_content},
+        ]
+
+        if self.ai_generator.anthropic_client:
+            raw = self.ai_generator._call_claude(messages, max_tokens=4096)
+        else:
+            # Groq text-only fallback
+            try:
+                resp = self.ai_generator.groq_client.chat.completions.create(
+                    model=self.ai_generator.model,
+                    messages=[
+                        {"role": "system", "content": system_text},
+                        {"role": "user", "content": prompt_text},
+                    ],
+                    temperature=0.1,
+                    max_tokens=4096,
+                )
+                raw = resp.choices[0].message.content
+            except Exception as _e:
+                logger.error(f"[DECOMPOSE] Groq fallback failed for {spec.name}: {_e}")
+                return None
+
+        if not raw:
+            return None
+
+        # Strip markdown code fences Claude sometimes wraps the response in
+        code = raw.strip()
+        if code.startswith("```"):
+            code = code.split("\n", 1)[1] if "\n" in code else code[3:]
+        if "```" in code:
+            code = code[:code.rfind("```")]
+        return code.strip()
+
+    def _generate_decomposed_page_layout(
+        self,
+        page_name: str,
+        specs,                  # List[ComponentSpec]
+        generated: List[Dict],  # only successfully generated specs
+        frame,                  # FigmaNode — for dimension hints
+    ) -> str:
+        """Programmatically compose a page layout that imports and renders sub-components."""
+        generated_names = {d["name"] for d in generated}
+
+        # Imports — deduplicated (same name must not be imported twice)
+        imported: set = set()
+        import_lines: List[str] = []
+        for s in specs:
+            if s.name in generated_names and s.name not in imported:
+                import_lines.append(f"import {s.name} from './{s.name}'")
+                imported.add(s.name)
+
+        # Detect sidebar: any layout_region narrower than 32% of frame width
+        has_sidebar = any(
+            s.component_type == "layout_region" and s.node.width < frame.width * 0.32
+            for s in specs if s.name in generated_names
+        )
+
+        # Data declarations — only for templates that have actual per-instance diffs
+        data_decls: List[str] = []
+        for spec in specs:
+            if spec.name not in generated_names or not spec.is_template:
+                continue
+            non_empty = [inst for inst in spec.instances if inst]
+            if not non_empty:
+                continue  # no diffs — will render N plain tags instead
+            var = spec.name[0].lower() + spec.name[1:] + "Data"
+            entries = [
+                "  { id: " + str(i) + ", " + ", ".join(f"{k}: {repr(v)}" for k, v in inst.items()) + " }"
+                for i, inst in enumerate(non_empty)
+            ]
+            data_decls.append(f"const {var} = [\n" + ",\n".join(entries) + "\n]")
+
+        # Render expressions — use a parallel list of (render_str, spec) for layout splitting
+        render_pairs: List[tuple] = []   # (render_str, spec)
+        rendered_names: set = set()      # guard against double-rendering
+        for spec in specs:
+            if spec.name not in generated_names or spec.name in rendered_names:
+                continue
+            rendered_names.add(spec.name)
+            if spec.is_template:
+                non_empty = [inst for inst in spec.instances if inst]
+                if non_empty:
+                    # Map over data array
+                    var = spec.name[0].lower() + spec.name[1:] + "Data"
+                    render_str = (
+                        f"      {{{var}.map((item) => (\n"
+                        f"        <{spec.name} key={{item.id}} {{...item}} />\n"
+                        f"      ))}}"
+                    )
+                else:
+                    # No varying data — render N plain instances
+                    render_str = "\n".join(
+                        f"      <{spec.name} />" for _ in range(spec.instance_count)
+                    )
+            else:
+                render_str = f"      <{spec.name} />"
+            render_pairs.append((render_str, spec))
+
+        # Layout wrapper
+        if has_sidebar:
+            sidebar_names = {
+                s.name for s in specs
+                if s.component_type == "layout_region"
+                and s.node.width < frame.width * 0.32
+                and s.name in generated_names
+            }
+            sidebar_renders = [r for r, s in render_pairs if s.name in sidebar_names]
+            other_renders   = [r for r, s in render_pairs if s.name not in sidebar_names]
+            body = (
+                '    <div className="flex h-screen overflow-hidden">\n'
+                + "\n".join(sidebar_renders) + "\n"
+                + '      <div className="flex-1 flex flex-col overflow-hidden">\n'
+                + "\n".join(other_renders) + "\n"
+                + '      </div>\n'
+                + '    </div>'
+            )
+        else:
+            body = (
+                '    <div className="w-full">\n'
+                + "\n".join(r for r, _ in render_pairs) + "\n"
+                + '    </div>'
+            )
+
+        data_block = ("\n\n" + "\n\n".join(data_decls)) if data_decls else ""
+        return (
+            "\n".join(import_lines)
+            + data_block
+            + f"\n\nexport default function {page_name}() {{\n"
+            + "  return (\n"
+            + body + "\n"
+            + "  )\n"
+            + "}\n"
+        )
+
+    def _describe_node_for_prompt(self, node, image_map: Dict[str, str], depth: int = 0, max_depth: int = 5) -> str:
+        """Recursive tree description of a FigmaNode for the AI prompt."""
+        indent = "  " * depth
+        raw = node.raw if hasattr(node, 'raw') and node.raw else {}
+        type_str = raw.get("type", node.type or "FRAME")
+        name = raw.get("name", node.name or "")
+        w = int(node.width)
+        h = int(node.height)
+        line = f'{indent}{type_str} "{name}" {w}x{h}'
+
+        # Layout
+        layout = raw.get("layoutMode")
+        if layout and layout != "NONE":
+            gap = raw.get("itemSpacing", 0)
+            line += f" layout={layout} gap={gap}"
+
+        # Background color (first solid fill)
+        fills = raw.get("fills", [])
+        if isinstance(fills, list):
+            for f in fills:
+                if isinstance(f, dict) and f.get("type") == "SOLID" and f.get("visible", True):
+                    c = f.get("color", {})
+                    r, g, b = int(c.get("r", 0) * 255), int(c.get("g", 0) * 255), int(c.get("b", 0) * 255)
+                    line += f" bg=#{r:02x}{g:02x}{b:02x}"
+                    break
+                if isinstance(f, dict) and f.get("type") == "IMAGE" and f.get("visible", True):
+                    ref = f.get("imageRef", "")
+                    img_path = image_map.get(ref, image_map.get(node.id, ""))
+                    if img_path:
+                        line += f' image="{img_path}"'
+                    else:
+                        line += " image=<fill>"
+                    break
+
+        # Corner radius
+        radius = raw.get("cornerRadius")
+        if radius:
+            line += f" rounded={radius}"
+
+        # Text node: content + typography
+        if type_str == "TEXT":
+            chars = raw.get("characters", "")
+            style = raw.get("style", {})
+            fs = style.get("fontSize", "")
+            fw = style.get("fontWeight", "")
+            line += f' text="{chars[:80]}"'
+            if fs:
+                line += f" size={fs}"
+            if fw:
+                line += f" weight={fw}"
+
+        # Clipping / opacity
+        if raw.get("clipsContent"):
+            line += " clip=true"
+        opacity = raw.get("opacity")
+        if opacity is not None and opacity < 1:
+            line += f" opacity={opacity:.2f}"
+
+        lines = [line]
+
+        # Recurse into visible children
+        if depth < max_depth and hasattr(node, 'children'):
+            for child in node.children:
+                if child.raw.get("visible", True) if hasattr(child, 'raw') and child.raw else True:
+                    lines.append(self._describe_node_for_prompt(child, image_map, depth + 1, max_depth))
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _describe_fills(fills: List[Dict]) -> str:
+        """Convert a fills list to a human-readable color/gradient string."""
+        parts: List[str] = []
+        for f in fills:
+            if not isinstance(f, dict) or not f.get("visible", True):
+                continue
+            ftype = f.get("type")
+            if ftype == "SOLID":
+                c = f.get("color", {})
+                r, g, b = int(c.get("r", 0) * 255), int(c.get("g", 0) * 255), int(c.get("b", 0) * 255)
+                a = f.get("opacity", c.get("a", 1.0))
+                parts.append(f"#{r:02x}{g:02x}{b:02x}" + (f" (opacity {a:.2f})" if a < 0.99 else ""))
+            elif ftype == "GRADIENT_LINEAR":
+                stops = f.get("gradientStops", [])
+                stop_colors = []
+                for s in stops[:2]:
+                    c = s.get("color", {})
+                    r, g, b = int(c.get("r", 0) * 255), int(c.get("g", 0) * 255), int(c.get("b", 0) * 255)
+                    stop_colors.append(f"#{r:02x}{g:02x}{b:02x}")
+                parts.append(f"linear-gradient({' → '.join(stop_colors)})")
+            elif ftype == "IMAGE":
+                parts.append("image-fill")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _collect_text_content(node) -> List[str]:
+        """Walk the subtree and collect all non-empty TEXT node characters."""
+        texts: List[str] = []
+        def _walk(n) -> None:
+            if n.type == "TEXT" and n.characters:
+                texts.append(n.characters.strip())
+            for child in n.children:
+                _walk(child)
+        _walk(node)
+        return texts
+
+    @staticmethod
+    def _collect_image_refs(node, image_map: Dict[str, str]) -> List[str]:
+        """Walk the subtree and return image paths present in image_map."""
+        refs: List[str] = []
+        seen: set = set()
+        def _walk(n) -> None:
+            if n.id in image_map and n.id not in seen:
+                refs.append(image_map[n.id])
+                seen.add(n.id)
+            for child in n.children:
+                _walk(child)
+        _walk(node)
+        return refs
+
+    # ──────────────────────────────────────────────────────────────────────────
+
     def _fetch_file(self, file_id: str) -> Dict:
         """Fetch Figma file with caching and retry logic - ⭐ UPDATED"""
         # Check cache first — use absolute path so it's stable regardless of cwd
