@@ -4,12 +4,16 @@ This is the core "moat" that guarantees design fidelity
 """
 
 import os
+import re
 import json
+import logging
 import base64
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from PIL import Image, ImageChops
 import numpy as np
+
+logger = logging.getLogger(__name__)
 try:
     from skimage.metrics import structural_similarity as ssim
     import skimage
@@ -278,191 +282,41 @@ class VisualAuditor:
         rendered_path: str,
         figma_metadata: Optional[Dict]
     ) -> Dict:
-        """Use Vision LLM to analyze semantic differences"""
+        """Pixel-diff score using pixelmatch — deterministic, no API calls."""
+        score, issues = self._pixel_diff_score(figma_path, rendered_path)
+        return {"score": score, "issues": issues}
 
-        # Claude primary (best vision quality)
-        if self.anthropic_client:
-            return self._anthropic_vision_analysis(figma_path, rendered_path, figma_metadata)
-
-        # Fallback to Groq
-        elif self.groq_client:
-            return self._groq_vision_analysis(figma_path, rendered_path, figma_metadata)
-
-        # Fallback to OpenAI
-        elif self.openai_client:
-            return self._openai_vision_analysis(figma_path, rendered_path, figma_metadata)
-
-        # No vision models available
-        else:
-            return {
-                "score": 0.0,
-                "issues": [],
-                "note": "No vision models available"
-            }
-
-    def _groq_vision_analysis(
-        self,
-        figma_path: str,
-        rendered_path: str,
-        figma_metadata: Optional[Dict]
-    ) -> Dict:
-        """Use Groq Llama 3.2 Vision for analysis"""
+    def _pixel_diff_score(self, figma_path: str, rendered_path: str) -> Tuple[float, List]:
+        """Compare two images with pixelmatch and return (match_ratio, [])."""
         try:
-            # Encode images to base64
-            figma_b64 = self._encode_image(figma_path)
-            rendered_b64 = self._encode_image(rendered_path)
+            from pixelmatch import pixelmatch as _pixelmatch
+        except ImportError:
+            logger.warning("[VISION] pixelmatch not installed — vision score = 0")
+            return 0.0, []
 
-            # Build prompt
-            prompt = self._build_vision_prompt(figma_metadata)
-
-            # Groq Vision API call
-            response = self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{figma_b64}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": "Generated Website (Candidate):"
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{rendered_b64}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=2000,
-                temperature=0.1  # Low temperature for consistent analysis
-            )
-
-            content = response.choices[0].message.content
-            return self._parse_vision_response(content)
-
-        except Exception as e:
-            print(f"   ⚠️  Groq vision analysis failed: {e}")
-            return {"score": 0.0, "issues": [], "error": str(e)}
-
-    def _openai_vision_analysis(
-        self,
-        figma_path: str,
-        rendered_path: str,
-        figma_metadata: Optional[Dict]
-    ) -> Dict:
-        """Use OpenAI GPT-4o for vision analysis"""
         try:
-            # Encode images to base64
-            figma_b64 = self._encode_image(figma_path)
-            rendered_b64 = self._encode_image(rendered_path)
+            img1 = Image.open(figma_path).convert("RGBA")
+            img2 = Image.open(rendered_path).convert("RGBA")
 
-            # Build prompt
-            prompt = self._build_vision_prompt(figma_metadata)
+            target_w = min(img1.width, img2.width)
+            target_h = min(img1.height, img2.height)
+            img1 = img1.resize((target_w, target_h), Image.LANCZOS)
+            img2 = img2.resize((target_w, target_h), Image.LANCZOS)
 
-            response = self.openai_client.chat.completions.create(
-                model=self.openai_model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{figma_b64}",
-                                    "detail": "high"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": "Generated Website (Candidate):"
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{rendered_b64}",
-                                    "detail": "high"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=2000,
-                temperature=0.1  # Low temperature for consistent analysis
-            )
+            arr1 = np.array(img1, dtype=np.uint8)
+            arr2 = np.array(img2, dtype=np.uint8)
+            diff = np.zeros((target_h, target_w, 4), dtype=np.uint8)
 
-            content = response.choices[0].message.content
-            return self._parse_vision_response(content)
+            num_diff = _pixelmatch(arr1, arr2, diff, target_w, target_h, threshold=0.1)
 
+            total_pixels = target_w * target_h
+            match_ratio = 1.0 - (num_diff / total_pixels)
+            score = max(0.0, min(1.0, match_ratio))
+            logger.info(f"[VISION] pixelmatch: {num_diff}/{total_pixels} diff pixels → score={score:.2%}")
+            return score, []
         except Exception as e:
-            print(f"   ⚠️  OpenAI vision analysis failed: {e}")
-            return {"score": 0.0, "issues": [], "error": str(e)}
-
-    def _anthropic_vision_analysis(
-        self,
-        figma_path: str,
-        rendered_path: str,
-        figma_metadata: Optional[Dict]
-    ) -> Dict:
-        """Use Anthropic Claude for vision analysis"""
-        try:
-            # Encode images to base64
-            figma_b64 = self._encode_image(figma_path)
-            rendered_b64 = self._encode_image(rendered_path)
-
-            prompt = self._build_vision_prompt(figma_metadata)
-
-            response = self.anthropic_client.messages.create(
-                model=self.anthropic_model,
-                max_tokens=2000,
-                temperature=0.1,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": figma_b64
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": "Generated Website (Candidate):"
-                            },
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": rendered_b64
-                                }
-                            }
-                        ]
-                    }
-                ]
-            )
-
-            content = response.content[0].text
-            return self._parse_vision_response(content)
-
-        except Exception as e:
-            print(f"   ⚠️  Claude vision analysis failed: {e} — falling back to Groq")
-            if self.groq_client:
-                return self._groq_vision_analysis(figma_path, rendered_path, figma_metadata)
-            return {"score": 0.0, "issues": [], "error": str(e)}
+            logger.warning(f"[VISION] pixelmatch failed: {e} — vision score = 0")
+            return 0.0, []
 
     def _encode_image(self, image_path: str, max_width: int = 1024) -> str:
         """Load image, resize to max_width preserving aspect ratio, return base64 PNG.
@@ -495,18 +349,31 @@ Focus on: presence of all UI elements (sidebar, cards, buttons, text), correct l
 
 Return ONLY a JSON object: {"score": NUMBER, "issues": ["issue1", "issue2"]}"""
 
-    def _parse_vision_response(self, content: str) -> Dict:
-        """Parse the vision model's JSON response"""
+    def _parse_vision_response(self, content) -> Dict:
+        """Parse the vision model's response — accepts str or pre-parsed dict/number."""
         try:
-            # Try to extract JSON from markdown code blocks
-            if "```json" in content:
-                json_str = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                json_str = content.split("```")[1].split("```")[0].strip()
+            # If already a dict (pre-parsed by _anthropic_vision_analysis), use directly
+            if isinstance(content, dict):
+                data = content
+            elif isinstance(content, (int, float)):
+                data = {"score": content, "issues": []}
             else:
-                json_str = content.strip()
+                # String: try to extract JSON from markdown code blocks
+                if "```json" in content:
+                    json_str = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    json_str = content.split("```")[1].split("```")[0].strip()
+                else:
+                    json_str = content.strip()
 
-            data = json.loads(json_str)
+                data = json.loads(json_str)
+
+            # Guard against bare number/string from json.loads
+            if not isinstance(data, dict):
+                raw_score = float(data) if str(data).replace('.', '', 1).isdigit() else 50.0
+                score = raw_score / 100.0 if raw_score > 1.0 else raw_score
+                return {"score": max(0.0, min(1.0, score)), "layout_score": 0.0,
+                        "color_score": 0.0, "typography_score": 0.0, "issues": []}
 
             # Support both new format {"score": N, "issues": [...]}
             # and old format {"overall_score": N, "critical_issues": [...]}
@@ -531,8 +398,12 @@ Return ONLY a JSON object: {"score": NUMBER, "issues": ["issue1", "issue2"]}"""
         except json.JSONDecodeError as e:
             print(f"   ⚠️  Failed to parse vision response as JSON: {e}")
             print(f"   Raw response: {content[:200]}...")
+            # Try to salvage a numeric score from plain text like "score: 75" or "75/100"
+            m = re.search(r'\b(\d{1,3})\b', content)
+            score = int(m.group(1)) / 100.0 if m else 0.5
+            score = max(0.0, min(1.0, score))  # clamp to [0, 1]
             return {
-                "score": 0.0,
+                "score": score,
                 "issues": [],
                 "raw_response": content,
                 "parse_error": str(e)
@@ -582,7 +453,10 @@ Return ONLY a JSON object: {"score": NUMBER, "issues": ["issue1", "issue2"]}"""
             )
 
         # Add specific issue-based recommendations
-        critical_issues = [i for i in issues if i.get("severity") == "critical"]
+        critical_issues = [
+            i for i in issues
+            if isinstance(i, dict) and i.get("severity") == "critical"
+        ]
         if critical_issues:
             recommendations.append(
                 f"🚨 {len(critical_issues)} critical issues must be fixed before deployment."

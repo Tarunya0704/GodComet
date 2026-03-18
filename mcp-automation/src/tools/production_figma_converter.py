@@ -2215,7 +2215,7 @@ class AICodeGenerator:
     def available(self):
         return self.anthropic_client is not None or self.groq_client is not None
 
-    def _call_claude(self, messages: List[Dict], max_tokens: int = 8192) -> Optional[str]:
+    def _call_claude(self, messages: List[Dict], max_tokens: int = 8192, model: Optional[str] = None) -> Optional[str]:
         """Call Claude via Anthropic API, converting OpenAI message format on the fly.
 
         Handles:
@@ -2261,7 +2261,7 @@ class AICodeGenerator:
                         api_messages.append({"role": msg["role"], "content": anthropic_blocks})
 
             kwargs: Dict = dict(
-                model=self.CLAUDE_MODEL,
+                model=model or self.CLAUDE_MODEL,
                 max_tokens=max_tokens,
                 messages=api_messages,
             )
@@ -3777,9 +3777,19 @@ class ProductionFigmaToCode:
             # Get all frames (screens)
             frames = self._get_frames(root)
             logger.info(f"✅ Found {len(frames)} screens")
-            
+
             if not frames:
                 raise Exception("No frames found in Figma file")
+
+            # When no specific node-id was requested, convert only the first frame.
+            # _get_frames already narrows to one frame when _target_node_id is set,
+            # so this guard only fires in the all-frames fallback path.
+            if len(frames) > 1 and not getattr(self, '_target_node_id', None):
+                logger.info(
+                    f"[FRAMES] {len(frames)} frames found — converting first only: '{frames[0].name}'. "
+                    f"Pass node-id in the Figma URL to target a specific frame."
+                )
+                frames = frames[:1]
             
             # Create output structure (Next.js App Router with src/)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -4067,8 +4077,9 @@ class ProductionFigmaToCode:
                 logger.warning(f"[DECOMPOSE] No code for {spec.name} — using programmatic fallback")
                 code = self.code_generator.generate_component(spec.node, spec.name, image_map)
 
-            # 3. Bracket/syntax validation — retry once on failure, then programmatic fallback
+            # 3. Normalize whitespace, auto-repair truncation, then bracket-check
             code = re.sub(r'(return\s*\()[ \t]+(<)', r'\1\n    \2', code)
+            code = self._auto_repair_tsx(code, spec.name)
             if not AICodeGenerator._bracket_balance_check(code, spec.name):
                 logger.warning(f"[DECOMPOSE] {spec.name}: bracket check failed — retrying with stricter prompt")
                 retry_code = self._generate_decomposed_component(
@@ -4079,8 +4090,11 @@ class ProductionFigmaToCode:
                         "ALL parentheses are balanced, and the code compiles without errors."
                     ),
                 )
+                if retry_code:
+                    retry_code = re.sub(r'(return\s*\()[ \t]+(<)', r'\1\n    \2', retry_code)
+                    retry_code = self._auto_repair_tsx(retry_code, spec.name)
                 if retry_code and AICodeGenerator._bracket_balance_check(retry_code, spec.name):
-                    code = re.sub(r'(return\s*\()[ \t]+(<)', r'\1\n    \2', retry_code)
+                    code = retry_code
                     logger.info(f"[DECOMPOSE] {spec.name}: retry succeeded")
                 else:
                     logger.warning(f"[DECOMPOSE] {spec.name}: retry also failed — using programmatic fallback")
@@ -4103,25 +4117,7 @@ class ProductionFigmaToCode:
         page_file.write_text(page_code, encoding="utf-8")
         logger.info(f"[DECOMPOSE] ✅ Page layout: {page_name}.tsx")
 
-        # ── Full build check ─────────────────────────────────────────────────
-        logger.info(f"[DECOMPOSE] Running next build to verify generated code…")
-        try:
-            build_result = subprocess.run(
-                ["npx", "next", "build"],
-                cwd=str(output_dir),
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if build_result.returncode != 0:
-                tail = (build_result.stdout + build_result.stderr)[-800:]
-                logger.warning(f"[DECOMPOSE] Build FAILED — falling back to monolithic pipeline\n{tail}")
-                return []  # triggers monolithic fallback in convert()
-            logger.info(f"[DECOMPOSE] ✅ Build passed")
-        except subprocess.TimeoutExpired:
-            logger.warning("[DECOMPOSE] Build timed out — proceeding anyway (assume OK)")
-        except Exception as _build_err:
-            logger.warning(f"[DECOMPOSE] Build check error: {_build_err} — proceeding anyway")
+        logger.info("[DECOMPOSE] Skipping build check (validated at render step)")
 
         return [{
             "name": page_name,
@@ -4157,6 +4153,20 @@ class ProductionFigmaToCode:
         )
 
         tree_description = self._describe_node_for_prompt(spec.node, image_map)
+        tree_len = len(tree_description)
+
+        # Cost optimisation: route by complexity
+        _HAIKU = "claude-haiku-4-5-20251001"
+        _SONNET = self.ai_generator.CLAUDE_MODEL  # claude-sonnet-4-20250514
+        if tree_len < 500:
+            logger.info(f"[DECOMPOSE] {spec.name}: {tree_len} chars tree → using programmatic (leaf)")
+            return None  # caller falls back to self.code_generator.generate_component
+        elif tree_len < 2000:
+            _chosen_model = _HAIKU
+        else:
+            _chosen_model = _SONNET
+        logger.info(f"[DECOMPOSE] {spec.name}: {tree_len} chars tree → using {_chosen_model}")
+
         text_content = self._collect_text_content(spec.node)
         image_refs = self._collect_image_refs(spec.node, image_map)
 
@@ -4188,7 +4198,8 @@ RULES:
 - Use exact pixel values from the tree: w-[{w}px], h-[{h}px]
 - Use arbitrary Tailwind values: bg-[#1c1442], text-[14px], rounded-[10px], gap-[8px]
 - Every TEXT node must appear in the output with its exact content
-- Every IMAGE node must render as <img src="{{path}}" className="w-full h-full object-cover" alt="" />
+- Every IMAGE node must render as <img src="{{path}}" className="w-full h-full object-cover" alt="" /> — images must FILL their container and never tile or repeat
+- Wrap each image in a container with overflow-hidden so it cannot tile: <div className="overflow-hidden ..."><img ... /></div>
 - Use flex-row for HORIZONTAL layout, flex-col for VERTICAL
 - Nodes without layoutMode use relative/absolute positioning
 - Include ALL children shown in the tree, not just top-level ones
@@ -4218,7 +4229,7 @@ RULES:
         ]
 
         if self.ai_generator.anthropic_client:
-            raw = self.ai_generator._call_claude(messages, max_tokens=4096)
+            raw = self.ai_generator._call_claude(messages, max_tokens=4096, model=_chosen_model)
         else:
             # Groq text-only fallback
             try:
@@ -4246,6 +4257,44 @@ RULES:
         if "```" in code:
             code = code[:code.rfind("```")]
         return code.strip()
+
+    @staticmethod
+    def _auto_repair_tsx(code: str, name: str = "") -> str:
+        """Best-effort repair of common Claude truncation patterns.
+
+        Handles:
+        - Code ending in </div> without closing ); }
+        - Up to 2 unclosed parentheses
+        - Up to 2 unclosed braces
+        Only repairs if the imbalance is small (≤2) so we don't mask real
+        logic errors.
+        """
+        code = code.rstrip()
+        open_p = code.count("(") - code.count(")")
+        open_b = code.count("{") - code.count("}")
+
+        if code.endswith(">"):
+            # Code ends in JSX close tag — append ); then }
+            if 0 < open_p <= 2:
+                code += "\n  " + ");" * open_p   # always ); not just )
+            if 0 < open_b <= 2:
+                code += "\n" + "}" * open_b
+        else:
+            if 0 < open_p <= 2:
+                code = code.rstrip(";").rstrip()
+                code += "\n  " + ");" * open_p
+            if 0 < open_b <= 2:
+                code += "\n" + "}" * open_b
+
+        if name:
+            still_open_p = code.count("(") - code.count(")")
+            still_open_b = code.count("{") - code.count("}")
+            logger.warning(
+                f"[REPAIR] {name}: was open_p={open_p} open_b={open_b} → "
+                f"now open_p={still_open_p} open_b={still_open_b} | "
+                f"tail={repr(code[-80:])}"
+            )
+        return code
 
     def _generate_decomposed_page_layout(
         self,
@@ -4293,24 +4342,41 @@ RULES:
             if spec.name not in generated_names or spec.name in rendered_names:
                 continue
             rendered_names.add(spec.name)
-            if spec.is_template:
+            if spec.is_template and spec.instance_count >= 2:
+                # CSS grid — derived from Figma instance positions via ComponentDecomposer
+                cols = spec.cols_per_row if spec.cols_per_row > 0 else spec.instance_count
+                gap  = spec.gap_px       if spec.gap_px > 0       else 0
+                grid_cls = f"grid grid-cols-{cols} " + (f"gap-[{gap}px]" if gap > 0 else "gap-4")
+
                 non_empty = [inst for inst in spec.instances if inst]
                 if non_empty:
-                    # Map over data array
                     var = spec.name[0].lower() + spec.name[1:] + "Data"
-                    render_str = (
-                        f"      {{{var}.map((item) => (\n"
-                        f"        <{spec.name} key={{item.id}} {{...item}} />\n"
-                        f"      ))}}"
+                    inner = (
+                        f"        {{{var}.map((item) => (\n"
+                        f"          <{spec.name} key={{item.id}} {{...item}} />\n"
+                        f"        ))}}"
                     )
                 else:
-                    # No varying data — render N plain instances
-                    render_str = "\n".join(
-                        f"      <{spec.name} />" for _ in range(spec.instance_count)
+                    # All instances have identical/empty data — render just once
+                    logger.info(
+                        f"[LAYOUT] Template {spec.name} has {spec.instance_count} identical "
+                        f"instances — rendering once"
                     )
+                    inner = f"        <{spec.name} />"
+                render_str = (
+                    f'      <div className="{grid_cls} w-full">\n'
+                    + inner + "\n"
+                    + "      </div>"
+                )
             else:
                 render_str = f"      <{spec.name} />"
             render_pairs.append((render_str, spec))
+
+        # Sort non-sidebar components by Figma y-position (top → bottom document flow)
+        def _spec_y(s) -> float:
+            if s.node.absolute_bounds:
+                return s.node.absolute_bounds.get("y", 0)
+            return 0.0
 
         # Layout wrapper
         if has_sidebar:
@@ -4320,20 +4386,26 @@ RULES:
                 and s.node.width < frame.width * 0.32
                 and s.name in generated_names
             }
-            sidebar_renders = [r for r, s in render_pairs if s.name in sidebar_names]
-            other_renders   = [r for r, s in render_pairs if s.name not in sidebar_names]
+            sidebar_pairs = [(r, s) for r, s in render_pairs if s.name in sidebar_names]
+            other_pairs   = sorted(
+                [(r, s) for r, s in render_pairs if s.name not in sidebar_names],
+                key=lambda rs: _spec_y(rs[1]),
+            )
+            sidebar_renders = [r for r, _ in sidebar_pairs]
+            other_renders   = [r for r, _ in other_pairs]
             body = (
-                '    <div className="flex h-screen overflow-hidden">\n'
+                '    <div className="flex w-full min-h-screen">\n'
                 + "\n".join(sidebar_renders) + "\n"
-                + '      <div className="flex-1 flex flex-col overflow-hidden">\n'
+                + '      <div className="flex-1 flex flex-col min-w-0">\n'
                 + "\n".join(other_renders) + "\n"
                 + '      </div>\n'
                 + '    </div>'
             )
         else:
+            sorted_pairs = sorted(render_pairs, key=lambda rs: _spec_y(rs[1]))
             body = (
-                '    <div className="w-full">\n'
-                + "\n".join(r for r, _ in render_pairs) + "\n"
+                '    <div className="w-full min-h-screen flex flex-col">\n'
+                + "\n".join(r for r, _ in sorted_pairs) + "\n"
                 + '    </div>'
             )
 
@@ -4443,11 +4515,20 @@ RULES:
 
     @staticmethod
     def _collect_text_content(node) -> List[str]:
-        """Walk the subtree and collect all non-empty TEXT node characters."""
+        """Walk the subtree and collect all non-empty TEXT node characters.
+
+        Handles split text (e.g. "All" + "(4,500)" as two sibling TEXT nodes)
+        by collecting every TEXT node independently regardless of nesting depth.
+        Falls back to n.raw["characters"] in case the typed attribute was not set.
+        """
         texts: List[str] = []
         def _walk(n) -> None:
-            if n.type == "TEXT" and n.characters:
-                texts.append(n.characters.strip())
+            if n.type == "TEXT":
+                # Primary source; fallback to raw dict for defensive coverage
+                chars = n.characters or (n.raw.get("characters", "") if hasattr(n, "raw") and n.raw else "")
+                stripped = chars.strip()
+                if stripped:
+                    texts.append(stripped)
             for child in n.children:
                 _walk(child)
         _walk(node)

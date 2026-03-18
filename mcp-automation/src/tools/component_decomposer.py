@@ -43,6 +43,8 @@ class ComponentSpec:
     is_template: bool = False
     instances: List[Dict] = field(default_factory=list)
     instance_count: int = 1
+    cols_per_row: int = 0   # >0 = use CSS grid with this many columns; 0 = unknown
+    gap_px: int = 0         # pixel gap between grid cells (derived from Figma spacing)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +439,7 @@ class ComponentDecomposer:
 
     def _pattern_to_spec(self, pat: RepeatedPattern) -> ComponentSpec:
         name = self._generate_component_name(pat.template)
+        cols, gap = self._compute_grid_dims(pat)
         return ComponentSpec(
             name=name,
             node=pat.template,
@@ -445,7 +448,63 @@ class ComponentDecomposer:
             is_template=True,
             instances=pat.per_instance_data,
             instance_count=len(pat.instances),
+            cols_per_row=cols,
+            gap_px=gap,
         )
+
+    def _compute_grid_dims(self, pat: RepeatedPattern) -> Tuple[int, int]:
+        """
+        Derive (cols_per_row, gap_px) from the actual positions of repeated instances.
+
+        Strategy:
+          1. Group instances by their y-coordinate (bucket width = child height * 0.3).
+             The largest bucket = number of columns per row.
+          2. Within the top row, sort by x and compute the average inter-item gap.
+        Returns (0, 0) if absolute_bounds are unavailable.
+        """
+        instances = pat.instances
+        child_w = pat.template.width
+        child_h = pat.template.height
+
+        # Collect (x, y) for each instance that has absolute_bounds
+        positions = []
+        for node in instances:
+            if node.absolute_bounds:
+                positions.append((
+                    node.absolute_bounds.get("x", 0),
+                    node.absolute_bounds.get("y", 0),
+                ))
+
+        if not positions or child_w <= 0:
+            return (0, 0)
+
+        # Group by y-row: two items are in the same row if their y-coords are within
+        # 30% of child_h of each other.
+        bucket_size = max(1.0, child_h * 0.3)
+        rows: Dict[int, List[float]] = defaultdict(list)
+        for x, y in positions:
+            bucket = int(y / bucket_size)
+            rows[bucket].append(x)
+
+        # cols = size of the largest y-bucket (most items in one row)
+        cols = max(len(xs) for xs in rows.values())
+        cols = max(1, cols)
+
+        # gap = average x-spacing between items in the top (first) row
+        top_bucket = min(rows.keys())
+        top_xs = sorted(rows[top_bucket])
+        if len(top_xs) >= 2:
+            gaps = [top_xs[i + 1] - top_xs[i] - child_w for i in range(len(top_xs) - 1)]
+            gap = max(0, round(sum(gaps) / len(gaps)))
+        else:
+            gap = 0
+
+        logger.info(
+            f"[Decomposer] Grid dims for '{pat.template.name}': "
+            f"cols={cols}, gap={gap}px (child={int(child_w)}×{int(child_h)}px, "
+            f"{len(instances)} instances)"
+        )
+        return (cols, gap)
 
     def _node_to_spec(
         self,
