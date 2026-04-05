@@ -138,6 +138,32 @@
         </div>
     </div>
 
+    <!-- Figma Picker Overlay -->
+    <div id="figmaPicker" class="figma-picker hidden">
+        <div class="picker-container">
+            <div class="picker-header">
+                <button class="picker-back hidden" id="pickerBack">← Back</button>
+                <h2 class="picker-title" id="pickerTitle">Select Frame</h2>
+                <button class="close-btn" id="pickerClose">✕</button>
+            </div>
+            <div class="picker-body" id="pickerBody">
+                <div class="picker-loading" id="pickerLoading">
+                    <div class="spinner"></div>
+                    <span>Fetching Figma file…</span>
+                </div>
+                <div id="frameGrid" class="frame-grid hidden"></div>
+                <div id="sectionList" class="section-list hidden"></div>
+            </div>
+            <div class="picker-footer hidden" id="pickerFooter">
+                <label class="select-all-label">
+                    <input type="checkbox" id="selectAllSections" checked>
+                    <span>All sections</span>
+                </label>
+                <button class="generate-btn" id="generateBtn">✨ Generate</button>
+            </div>
+        </div>
+    </div>
+
     <script src="renderer.js"></script>
 </body>
 </html>

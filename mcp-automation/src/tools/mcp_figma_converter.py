@@ -191,26 +191,15 @@ class MCPFigmaConverter(ProductionFigmaToCode):
                 f"(keys: {list(figma_data.keys()) if figma_data else 'none'})"
             )
 
-        # If YAML shape, synthesise a minimal document node so the pipeline works
+        # If YAML shape (no document key), MCP returned an incomplete format that
+        # lacks absoluteBoundingBox, fills/imageRef, and characters.
+        # Fall back to REST API immediately — it always returns full node data.
         if not has_document and has_yaml_shape:
-            nodes = figma_data.get("nodes") or {}
-            children = (
-                list(nodes.values()) if isinstance(nodes, dict)
-                else nodes if isinstance(nodes, list)
-                else []
+            logger.warning(
+                "⚠️ [MCP] YAML-shaped response detected — missing fills/imageRef/bounding boxes. "
+                "Falling back to REST API for complete node data."
             )
-            meta = figma_data.get("metadata")
-            doc_name = meta.get("name", "Document") if isinstance(meta, dict) else "Document"
-            figma_data["document"] = {
-                "id": "0:0",
-                "name": doc_name,
-                "type": "DOCUMENT",
-                "children": children,
-            }
-            logger.info(
-                "ℹ️ [MCP] YAML-shaped response — synthesised document node (%d top-level nodes)",
-                len(children),
-            )
+            return await super().convert(figma_url, output_dir, figma_screenshot_path)
 
         logger.info("✅ [MCP] Design tree fetched")
 

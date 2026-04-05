@@ -19,6 +19,14 @@ sys.path.insert(0, str(mcp_src))
 from workflow_state_machine import workflow_manager, WorkflowState, WorkflowContext
 from websocket_server import workflow_ws_server
 
+
+def _write_lf(path, text: str, encoding: str = "utf-8"):
+    """Write text with LF line endings — avoids CRLF on Windows breaking SWC/Next.js.
+    Normalises any embedded \\r\\n or bare \\r in the string before writing."""
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    with open(path, "w", encoding=encoding, newline="\n") as f:
+        f.write(text)
+
 logger = logging.getLogger(__name__)
 
 
@@ -671,7 +679,7 @@ class WorkflowExecutor:
             # Write healed code — keep backup so we can revert if the build breaks
             dest = project / main_rel
             backup_code = current_code  # already held in local var
-            dest.write_text(fixed_code, encoding="utf-8")
+            _write_lf(dest, fixed_code)
             tsx_files[main_rel] = fixed_code
             logger.info(f"[HEAL] Wrote healed code to {main_rel} ({len(fixed_code)} chars)")
 
@@ -693,7 +701,7 @@ class WorkflowExecutor:
                     f"[HEAL] Iteration {iteration}: re-render failed ({e}) — "
                     "reverting to backup and stopping"
                 )
-                dest.write_text(backup_code, encoding="utf-8")
+                _write_lf(dest, backup_code)
                 tsx_files[main_rel] = backup_code
                 break
 
@@ -723,7 +731,7 @@ class WorkflowExecutor:
                     f"[HEAL] Score did not improve ({previous_score:.0%} → {new_score:.0%}) — "
                     "reverting and stopping"
                 )
-                dest.write_text(backup_code, encoding="utf-8")
+                _write_lf(dest, backup_code)
                 tsx_files[main_rel] = backup_code
                 break
 
@@ -888,14 +896,14 @@ class WorkflowExecutor:
                 if code:
                     dest = project / rel_path
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_text(code, encoding="utf-8")
+                    _write_lf(dest, code)
                     written.append(rel_path)
         else:
             # No markers — try writing whole response to root page
             code = _re.sub(r'^```[^\n]*\n|```$', '', raw.strip(), flags=_re.MULTILINE).strip()
             if "export default" in code:
                 root = list(tsx_files.keys())[0]
-                (project / root).write_text(code, encoding="utf-8")
+                _write_lf(project / root, code)
                 written.append(root)
 
         if written:

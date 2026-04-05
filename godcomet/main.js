@@ -1068,10 +1068,79 @@ app.whenReady().then(() => {
       return response.data;
     } catch (error) {
       console.error('Failed to start workflow:', error.message);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // ── Figma Picker: list frames ──────────────────────────────────────────────
+  ipcMain.handle('get-figma-frames', async (event, figmaUrl) => {
+    try {
+      console.log(`🖼  Fetching frames for: ${figmaUrl}`);
+      const response = await axios.post(`${BACKEND_URL}/workflow/frames`, {
+        figma_url: figmaUrl
+      }, { timeout: 30000 });
+      return response.data;
+    } catch (error) {
+      console.error('get-figma-frames failed:', error.message);
+      throw new Error(error.response?.data?.detail || error.message);
+    }
+  });
+
+  // ── Figma Picker: list sections in a frame ─────────────────────────────────
+  ipcMain.handle('get-figma-sections', async (event, figmaUrl, frameId) => {
+    try {
+      console.log(`🧩 Fetching sections for frame: ${frameId}`);
+      const response = await axios.post(`${BACKEND_URL}/workflow/sections`, {
+        figma_url: figmaUrl,
+        frame_id: frameId
+      }, { timeout: 45000 });
+      return response.data;
+    } catch (error) {
+      console.error('get-figma-sections failed:', error.message);
+      throw new Error(error.response?.data?.detail || error.message);
+    }
+  });
+
+  // ── Regenerate a single section component then re-render ──────────────────
+  ipcMain.handle('regenerate-section', async (event, figmaUrl, frameId, sectionId, projectId) => {
+    try {
+      console.log(`🔄 Regenerating section ${sectionId} in project ${projectId}`);
+      const genRes = await axios.post(`${BACKEND_URL}/workflow/generate-section`, {
+        figma_url: figmaUrl,
+        frame_id: frameId,
+        section_id: sectionId,
+        project_id: projectId,
+      }, { timeout: 120000 });
+
+      // Re-render the project after writing the new component
+      const renderRes = await axios.post(`${BACKEND_URL}/workflow/rerender`, {
+        project_id: projectId,
+      }, { timeout: 60000 });
+
       return {
-        success: false,
-        error: error.message
+        success: true,
+        component_name: genRes.data.component_name,
+        screenshot_b64: renderRes.data.screenshot_b64,
       };
+    } catch (error) {
+      console.error('regenerate-section failed:', error.message);
+      return { success: false, error: error.response?.data?.detail || error.message };
+    }
+  });
+
+  // ── Figma Picker: start workflow with selected frame + sections ────────────
+  ipcMain.handle('start-workflow-with-frame', async (event, figmaUrl, frameId, sectionIds) => {
+    try {
+      console.log(`🚀 Starting workflow — frame: ${frameId}, sections: ${sectionIds?.length || 'all'}`);
+      const response = await axios.post(`${BACKEND_URL}/workflow/start`, {
+        figma_url: figmaUrl,
+        frame_id: frameId,
+        section_ids: sectionIds || []
+      }, { timeout: 30000 });
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('start-workflow-with-frame failed:', error.message);
+      return { success: false, error: error.response?.data?.detail || error.message };
     }
   });
 

@@ -227,16 +227,33 @@ class VisualAuditor:
             ar_diff = abs(figma_ar - rendered_ar) / max(figma_ar, rendered_ar)
 
             if ar_diff > 0.10:
-                # Aspect ratios too different — resize both to rendered width to
-                # preserve the rendered layout (it's the ground truth at its own AR)
-                target_w = rw
-                target_h = rh
+                # Aspect ratios differ significantly — intelligently crop the figma
+                # image to match the rendered AR before resizing.
+                # figma_ar < rendered_ar  → figma is too tall (extra content at TOP, e.g. guidelines text)
+                #   → crop from top, keep the bottom portion
+                # figma_ar > rendered_ar  → figma is too wide (extra content on sides)
+                #   → crop horizontally centered
                 print(
                     f"   ⚠️  Aspect ratio mismatch ({fw}×{fh} AR={figma_ar:.2f} vs "
-                    f"{rw}×{rh} AR={rendered_ar:.2f}, diff={ar_diff*100:.0f}%). "
-                    f"Resizing both to {target_w}×{target_h} (rendered dimensions)."
+                    f"{rw}×{rh} AR={rendered_ar:.2f}, diff={ar_diff*100:.0f}%)."
                 )
-                figma_img = figma_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                if figma_ar < rendered_ar:
+                    # Figma image is too tall — crop top (frame is at the bottom)
+                    crop_h = int(fw / rendered_ar)
+                    crop_h = min(crop_h, fh)
+                    crop_top = fh - crop_h
+                    figma_img = figma_img.crop((0, crop_top, fw, fh))
+                    print(f"   ✂️  Cropped figma: removed top {crop_top}px (extra content above frame) → {fw}×{crop_h}")
+                else:
+                    # Figma image is too wide — crop sides centered
+                    crop_w = int(fh * rendered_ar)
+                    crop_w = min(crop_w, fw)
+                    crop_left = (fw - crop_w) // 2
+                    figma_img = figma_img.crop((crop_left, 0, crop_left + crop_w, fh))
+                    print(f"   ✂️  Cropped figma: removed {crop_left}px from each side → {crop_w}×{fh}")
+
+                figma_img = figma_img.resize((rw, rh), Image.Resampling.LANCZOS)
+                print(f"   ⚙️  Resized cropped figma to rendered dimensions {rw}×{rh}")
                 # rendered_img is already the right size
             else:
                 print(f"   ⚙️  Resizing rendered: {rw}×{rh} → {fw}×{fh}")
@@ -287,9 +304,9 @@ class VisualAuditor:
         return {"score": score, "issues": issues}
 
     def _pixel_diff_score(self, figma_path: str, rendered_path: str) -> Tuple[float, List]:
-        """Compare two images with pixelmatch and return (match_ratio, [])."""
+        """Compare two images with pixelmatch (PIL contrib) and return (match_ratio, [])."""
         try:
-            from pixelmatch import pixelmatch as _pixelmatch
+            from pixelmatch.contrib.PIL import pixelmatch as _pm
         except ImportError:
             logger.warning("[VISION] pixelmatch not installed — vision score = 0")
             return 0.0, []
@@ -303,11 +320,8 @@ class VisualAuditor:
             img1 = img1.resize((target_w, target_h), Image.LANCZOS)
             img2 = img2.resize((target_w, target_h), Image.LANCZOS)
 
-            arr1 = np.array(img1, dtype=np.uint8)
-            arr2 = np.array(img2, dtype=np.uint8)
-            diff = np.zeros((target_h, target_w, 4), dtype=np.uint8)
-
-            num_diff = _pixelmatch(arr1, arr2, diff, target_w, target_h, threshold=0.1)
+            diff_img = Image.new("RGBA", (target_w, target_h))
+            num_diff = _pm(img1, img2, diff_img, threshold=0.1)
 
             total_pixels = target_w * target_h
             match_ratio = 1.0 - (num_diff / total_pixels)

@@ -32,7 +32,19 @@ class FigmaNode:
         self.children = [FigmaNode(c) for c in data.get("children", [])]
         
         # Layout properties
-        self.absolute_bounds = data.get("absoluteBoundingBox", {})
+        # Primary source: absoluteBoundingBox (standard Figma REST API)
+        # Fallback: direct width/height/x/y or size/position dicts (MCP YAML responses)
+        _bbox = data.get("absoluteBoundingBox")
+        if not _bbox:
+            _size = data.get("size") or {}
+            _pos  = data.get("position") or {}
+            _w = data.get("width")  or _size.get("width",  0)
+            _h = data.get("height") or _size.get("height", 0)
+            _x = data.get("x")      or _pos.get("x",       0)
+            _y = data.get("y")      or _pos.get("y",       0)
+            if _w or _h:
+                _bbox = {"width": _w, "height": _h, "x": _x, "y": _y}
+        self.absolute_bounds = _bbox or {}
         self.layout_mode = data.get("layoutMode", "NONE")  # AUTO-LAYOUT
         self.layout_positioning = data.get("layoutPositioning", "AUTO")  # "ABSOLUTE" = explicitly absolute within auto-layout parent
         self.constraints = data.get("constraints", {})
@@ -77,8 +89,13 @@ class FigmaNode:
         self.corner_radius = data.get("cornerRadius", 0)
         self.opacity = data.get("opacity", 1)
         
-        # Text properties
-        self.characters = data.get("characters", "")
+        # Text properties — MCP YAML may use "content" or "text" instead of "characters"
+        self.characters = (
+            data.get("characters")
+            or data.get("content")
+            or data.get("text")
+            or ""
+        )
         self.style = data.get("style", {})
         
         # Component properties
@@ -3150,14 +3167,18 @@ class AICodeGenerator:
             )
             return False
 
-        # Angle-bracket balance (very rough — only catches gross mismatches)
+        # Angle-bracket balance — self-closing tags count as both open and close,
+        # so a valid component should have opens == closes.
+        # Allow tolerance of 2 for regex edge cases (inline SVG paths, etc.)
         stripped = re.sub(r'"[^"]*"|\'[^\']*\'|`[^`]*`', '""', code)
+        # Also strip JSX comments {/* ... */} to avoid counting tags inside comments
+        stripped = re.sub(r'\{/\*.*?\*/\}', '', stripped, flags=re.DOTALL)
         opens  = len(re.findall(r'<[A-Za-z]', stripped))
         closes = len(re.findall(r'(?:</[A-Za-z]|/>)', stripped))
-        if abs(opens - closes) > max(5, opens * 0.05):
+        if abs(opens - closes) > 2:
             logger.warning(
                 f"[BRACKET CHECK] {component_name}: angle-bracket imbalance "
-                f"(opens={opens}, closes={closes})"
+                f"(opens={opens}, closes={closes}, diff={abs(opens-closes)})"
             )
             return False
 
@@ -3929,7 +3950,7 @@ class ProductionFigmaToCode:
                     logger.warning(f"⚠️ USE_AI=true but GROQ_API_KEY not set — using programmatic output")
 
                 comp_file = components_dir / f"{comp_name}.tsx"
-                with open(comp_file, "w", encoding="utf-8") as f:
+                with open(comp_file, "w", encoding="utf-8", newline="\n") as f:
                     f.write(code)
 
                 generated.append({
@@ -4065,6 +4086,13 @@ class ProductionFigmaToCode:
                     sw = min(sw, img_w - sx);  sh = min(sh, img_h - sy)
                     if sw > 0 and sh > 0:
                         cropped = frame_img.crop((sx, sy, sx + sw, sy + sh))
+                        # Upscale narrow crops so Claude receives at least 1024px wide
+                        if cropped.width < 1024:
+                            scale = 1024 / cropped.width
+                            cropped = cropped.resize(
+                                (1024, int(cropped.height * scale)),
+                                _PILImage.LANCZOS,
+                            )
                         crop_file = crops_dir / f"{spec.name}_crop.png"
                         cropped.save(str(crop_file))
                         cropped_path = str(crop_file)
@@ -4100,9 +4128,13 @@ class ProductionFigmaToCode:
                     logger.warning(f"[DECOMPOSE] {spec.name}: retry also failed — using programmatic fallback")
                     code = self.code_generator.generate_component(spec.node, spec.name, image_map)
 
-            # 4. Save
+            # 4. Save — normalize CRLF and ensure React import exists
+            code = code.replace('\r\n', '\n').replace('\r', '\n')
+            if not code.startswith("import React"):
+                code = "import React from 'react'\n\n" + code
             comp_file = components_dir / f"{spec.name}.tsx"
-            comp_file.write_text(code, encoding="utf-8")
+            with open(comp_file, "w", encoding="utf-8", newline="\n") as _f:
+                _f.write(code)
             logger.info(f"[DECOMPOSE] ✅ {spec.name}.tsx ({len(code)} chars)")
             generated_specs.append({"name": spec.name, "file": str(comp_file), "spec": spec})
 
@@ -4114,7 +4146,8 @@ class ProductionFigmaToCode:
         page_name = f"{comp_name}Page"
         page_code = self._generate_decomposed_page_layout(page_name, specs, generated_specs, frame)
         page_file = components_dir / f"{page_name}.tsx"
-        page_file.write_text(page_code, encoding="utf-8")
+        with open(page_file, "w", encoding="utf-8", newline="\n") as _f:
+            _f.write(page_code)
         logger.info(f"[DECOMPOSE] ✅ Page layout: {page_name}.tsx")
 
         logger.info("[DECOMPOSE] Skipping build check (validated at render step)")
@@ -4138,16 +4171,40 @@ class ProductionFigmaToCode:
         if not self.ai_generator.anthropic_client and not self.ai_generator.groq_client:
             return None
 
+        # Build role context for layout-aware prompting
+        role_hint = ""
+        if hasattr(spec, "component_type"):
+            if spec.component_type == "layout_region":
+                if spec.node.width < spec.node.height:
+                    role_hint = (
+                        "\nCOMPONENT ROLE: This is a SIDEBAR navigation panel. "
+                        "It should have h-full, a dark background, and vertical nav items. "
+                        "Use flex-col layout. Each nav item is an icon + label in a flex row."
+                    )
+                else:
+                    role_hint = (
+                        "\nCOMPONENT ROLE: This is a HEADER bar. "
+                        "It should be a horizontal flex row with items center-aligned."
+                    )
+            elif spec.component_type == "repeated_pattern":
+                role_hint = (
+                    f"\nCOMPONENT ROLE: This is a CARD that gets repeated ×{spec.instance_count}. "
+                    "Accept props for varying content. Keep it self-contained and compact."
+                )
+
         system_text = (
             "You are a pixel-perfect React + Tailwind CSS developer. "
             "Convert the Figma component to a TypeScript React component.\n\n"
-            "RULES:\n"
+            + (f"{role_hint}\n\n" if role_hint else "")
+            + "RULES:\n"
             "- Output ONLY raw TSX — no markdown fences, no explanations\n"
             f"- The function MUST be named EXACTLY: {spec.name} (case-sensitive)\n"
             "- Tailwind CSS classes; for non-standard values use arbitrary: w-[340px], text-[13px]\n"
-            "- Next.js <Image> for images (import Image from 'next/image'; width+height required)\n"
+            "- Use <img> (not Next.js Image) for images — simpler and avoids domain config issues\n"
             "- Match the screenshot exactly: colors, spacing, typography, borders, shadows\n"
+            "- Apply the exact font-size, font-weight, color, and line-height from the TEXT NODES block\n"
             "- Use exact hex colors from the node description\n"
+            "- If the component has an image with text overlaid: use relative on the container, absolute on the text\n"
             "- Escape { } inside JSX text with &#123; &#125;\n"
             "- ALL tags must be properly closed; ALL parentheses must be balanced"
         )
@@ -4168,12 +4225,64 @@ class ProductionFigmaToCode:
         logger.info(f"[DECOMPOSE] {spec.name}: {tree_len} chars tree → using {_chosen_model}")
 
         text_content = self._collect_text_content(spec.node)
-        image_refs = self._collect_image_refs(spec.node, image_map)
+        image_details = self._collect_image_details(spec.node, image_map)
+        text_details = self._collect_text_details(spec.node)
 
         w = int(spec.node.width)
         h = int(spec.node.height)
+
+        # Legacy simple lists (kept for backward compat sections of the prompt)
+        image_refs = [d["path"] for d in image_details if d["path"]]
         text_block = "\n".join(f'  "{t}"' for t in text_content[:30]) if text_content else "  (none)"
-        image_block = "\n".join(f"  {r}" for r in image_refs[:10]) if image_refs else "  (none)"
+
+        # Rich image block with exact position/size
+        if image_details:
+            image_block_lines = []
+            for d in image_details[:10]:
+                path_str = f"src='{d['path']}'" if d['path'] else "(no path — skip)"
+                image_block_lines.append(
+                    f"  Image at position ({d['x']},{d['y']}) size {d['w']}×{d['h']}px, "
+                    f"{path_str}, use object-cover to fill container"
+                )
+            image_block = "\n".join(image_block_lines)
+        else:
+            image_block = "  (none)"
+
+        # Rich text block with exact typography
+        if text_details:
+            text_detail_lines = []
+            for d in text_details[:30]:
+                parts = [f"Text '{d['content']}' at ({d['x']},{d['y']})"]
+                if d["fontSize"]:
+                    parts.append(f"font-size: {d['fontSize']}px")
+                if d["fontWeight"]:
+                    parts.append(f"font-weight: {d['fontWeight']}")
+                if d["color"]:
+                    parts.append(f"color: #{d['color']}")
+                if d["lineHeight"]:
+                    parts.append(f"line-height: {d['lineHeight']}px")
+                text_detail_lines.append("  " + ", ".join(parts))
+            text_detail_block = "\n".join(text_detail_lines)
+        else:
+            text_detail_block = "  (none)"
+
+        # Detect overlapping elements (any image node with a text sibling at a similar Y)
+        has_overlay = False
+        if image_details and text_details:
+            for img in image_details:
+                for txt in text_details:
+                    # Text is within the image's bounding box → overlay
+                    if (img["x"] <= txt["x"] <= img["x"] + img["w"] and
+                            img["y"] <= txt["y"] <= img["y"] + img["h"]):
+                        has_overlay = True
+                        break
+                if has_overlay:
+                    break
+
+        overlay_rule = (
+            "\n- OVERLAPPING ELEMENTS DETECTED: Use relative positioning on the "
+            "container div and absolute positioning on the overlay text/elements."
+        ) if has_overlay else ""
 
         template_section = ""
         if spec.is_template and spec.instances:
@@ -4183,7 +4292,25 @@ class ProductionFigmaToCode:
                 f"Define a TypeScript props interface for these varying fields:\n{varying}\n"
             )
 
+        if spec.is_template:
+            dim_rule = (
+                f"This component is a CARD rendered inside a CSS grid (original Figma size: {w}×{h}px).\n"
+                f"Use w-full for width — the grid controls column width.\n"
+                f"Use h-auto for the root — let content determine height naturally.\n"
+                f"Inner elements (images, text blocks) should keep their relative proportions."
+            )
+            root_cls_rule = f"- Root element: w-full h-auto (CARD: never use fixed height on root)"
+        else:
+            dim_rule = (
+                f"This component must be exactly {w}px wide and {h}px tall in the Figma design.\n"
+                f"Use w-full for width (it's in a vertical stack) and h-[{h}px] for height."
+            )
+            root_cls_rule = f"- Root element: w-full h-[{h}px] (never fixed pixel width on root)"
+
         prompt_text = f"""Convert this Figma component to a React + Tailwind component.
+
+COMPONENT DIMENSIONS:
+{dim_rule}
 
 COMPONENT TREE:
 {tree_description}
@@ -4191,18 +4318,26 @@ COMPONENT TREE:
 ALL TEXT CONTENT (use exactly these strings):
 {text_block}
 
-IMAGE REFERENCES (use these exact paths):
+TEXT NODES WITH EXACT TYPOGRAPHY:
+{text_detail_block}
+
+IMAGE NODES WITH EXACT POSITION AND SIZE:
 {image_block}
 {template_section}
 RULES:
-- Use exact pixel values from the tree: w-[{w}px], h-[{h}px]
+{root_cls_rule}
 - Use arbitrary Tailwind values: bg-[#1c1442], text-[14px], rounded-[10px], gap-[8px]
-- Every TEXT node must appear in the output with its exact content
-- Every IMAGE node must render as <img src="{{path}}" className="w-full h-full object-cover" alt="" /> — images must FILL their container and never tile or repeat
-- Wrap each image in a container with overflow-hidden so it cannot tile: <div className="overflow-hidden ..."><img ... /></div>
+- Every TEXT node must appear with its exact content, font-size, font-weight, and color from the typography block above
+- Every IMAGE node listed above: <img src="{{path}}" className="w-full h-full object-cover" alt="" /> — images MUST FILL their container and never tile or repeat
+- If an IMAGE node says "(no path — skip)", DO NOT render an <img> tag for it — use a placeholder div with bg-gray-300 instead
+- NEVER use inline base64 data URIs or style={{backgroundImage}} — always use <img src="/images/..." /> with the paths listed above
+- Wrap each image in an overflow-hidden container: <div className="overflow-hidden ..."><img ... /></div>
 - Use flex-row for HORIZONTAL layout, flex-col for VERTICAL
-- Nodes without layoutMode use relative/absolute positioning
+- Nodes without layoutMode use relative/absolute positioning{overlay_rule}
 - Include ALL children shown in the tree, not just top-level ones
+- Each UI element should appear ONCE — do not render both a text node AND a button/link for the same action (e.g. if the tree has a "View" text inside a button container, render only ONE clickable element)
+- Follow the tree structure exactly — if a node appears as a child of another, do NOT also render it separately at a higher level
+- If a child group contains an icon + label, render them as a single flex row, not as separate elements
 - The export MUST be exactly: export default function {spec.name}() (name is case-sensitive)
 - Return ONLY the code, no markdown fences, no explanation{extra_instruction}"""
 
@@ -4320,6 +4455,14 @@ RULES:
             for s in specs if s.name in generated_names
         )
 
+        # Detect header: layout_region wider than 70% and shorter than 15%
+        has_header = any(
+            s.component_type == "layout_region"
+            and s.node.width > frame.width * 0.50
+            and s.node.height < frame.height * 0.15
+            for s in specs if s.name in generated_names
+        )
+
         # Data declarations — only for templates that have actual per-instance diffs
         data_decls: List[str] = []
         for spec in specs:
@@ -4364,7 +4507,7 @@ RULES:
                     )
                     inner = f"        <{spec.name} />"
                 render_str = (
-                    f'      <div className="{grid_cls} w-full">\n'
+                    f'      <div className="{grid_cls} w-full items-start overflow-hidden">\n'
                     + inner + "\n"
                     + "      </div>"
                 )
@@ -4386,17 +4529,42 @@ RULES:
                 and s.node.width < frame.width * 0.32
                 and s.name in generated_names
             }
+            # Get sidebar pixel width for CSS
+            sidebar_w = 0
+            for s in specs:
+                if s.name in sidebar_names:
+                    sidebar_w = max(sidebar_w, int(s.node.width))
+
+            header_names = {
+                s.name for s in specs
+                if s.component_type == "layout_region"
+                and s.node.width > frame.width * 0.50
+                and s.node.height < frame.height * 0.15
+                and s.name in generated_names
+                and s.name not in sidebar_names
+            }
+
             sidebar_pairs = [(r, s) for r, s in render_pairs if s.name in sidebar_names]
+            header_pairs  = sorted(
+                [(r, s) for r, s in render_pairs if s.name in header_names],
+                key=lambda rs: _spec_y(rs[1]),
+            )
             other_pairs   = sorted(
-                [(r, s) for r, s in render_pairs if s.name not in sidebar_names],
+                [(r, s) for r, s in render_pairs if s.name not in sidebar_names and s.name not in header_names],
                 key=lambda rs: _spec_y(rs[1]),
             )
             sidebar_renders = [r for r, _ in sidebar_pairs]
+            header_renders  = [r for r, _ in header_pairs]
             other_renders   = [r for r, _ in other_pairs]
+
+            sw_class = f"w-[{sidebar_w}px] shrink-0" if sidebar_w else "w-64 shrink-0"
             body = (
-                '    <div className="flex w-full min-h-screen">\n'
+                '    <div className="flex w-full h-screen overflow-hidden">\n'
+                + f'      <div className="{sw_class} h-screen overflow-y-auto">\n'
                 + "\n".join(sidebar_renders) + "\n"
-                + '      <div className="flex-1 flex flex-col min-w-0">\n'
+                + '      </div>\n'
+                + '      <div className="flex-1 flex flex-col min-w-0 h-screen overflow-y-auto">\n'
+                + "\n".join(header_renders) + "\n"
                 + "\n".join(other_renders) + "\n"
                 + '      </div>\n'
                 + '    </div>'
@@ -4547,6 +4715,107 @@ RULES:
                 _walk(child)
         _walk(node)
         return refs
+
+    @staticmethod
+    def _collect_image_details(node, image_map: Dict[str, str]) -> List[Dict]:
+        """Walk the subtree and collect detailed position/size/path for every image node.
+
+        Position is expressed relative to the component's top-left corner using
+        absoluteBoundingBox. Nodes with an IMAGE fill or whose id is in image_map
+        are included.
+        """
+        root_raw = node.raw if hasattr(node, "raw") and node.raw else {}
+        root_bbox = root_raw.get("absoluteBoundingBox", {})
+        origin_x = root_bbox.get("x", 0)
+        origin_y = root_bbox.get("y", 0)
+
+        details: List[Dict] = []
+        seen: set = set()
+
+        def _walk(n) -> None:
+            raw = n.raw if hasattr(n, "raw") and n.raw else {}
+            bbox = raw.get("absoluteBoundingBox", {})
+            bx = bbox.get("x", 0) - origin_x
+            by = bbox.get("y", 0) - origin_y
+            bw = bbox.get("width", n.width)
+            bh = bbox.get("height", n.height)
+
+            # Check fills for IMAGE type
+            is_image_fill = any(
+                isinstance(f, dict) and f.get("type") == "IMAGE"
+                for f in raw.get("fills", [])
+            )
+            in_map = n.id in image_map or n.id.replace(":", "_") in image_map
+
+            if (is_image_fill or in_map) and n.id not in seen:
+                seen.add(n.id)
+                path = image_map.get(n.id, image_map.get(n.id.replace(":", "_"), ""))
+                details.append({
+                    "x": int(bx), "y": int(by),
+                    "w": int(bw), "h": int(bh),
+                    "path": path,
+                })
+            for child in n.children:
+                _walk(child)
+
+        _walk(node)
+        return details
+
+    @staticmethod
+    def _collect_text_details(node) -> List[Dict]:
+        """Walk the subtree and collect detailed typography info for every TEXT node.
+
+        Returns position relative to the component's top-left corner.
+        """
+        root_raw = node.raw if hasattr(node, "raw") and node.raw else {}
+        root_bbox = root_raw.get("absoluteBoundingBox", {})
+        origin_x = root_bbox.get("x", 0)
+        origin_y = root_bbox.get("y", 0)
+
+        details: List[Dict] = []
+
+        def _walk(n) -> None:
+            raw = n.raw if hasattr(n, "raw") and n.raw else {}
+            if raw.get("type", n.type) == "TEXT":
+                chars = n.characters or raw.get("characters", "")
+                if not chars or not chars.strip():
+                    for child in n.children:
+                        _walk(child)
+                    return
+
+                bbox = raw.get("absoluteBoundingBox", {})
+                bx = bbox.get("x", 0) - origin_x
+                by = bbox.get("y", 0) - origin_y
+
+                style = raw.get("style", {})
+                fs = style.get("fontSize", "")
+                fw = style.get("fontWeight", "")
+                lh = style.get("lineHeightPx", "")
+
+                # Text color from fills
+                hex_color = ""
+                for f in style.get("fills", raw.get("fills", [])):
+                    if isinstance(f, dict) and f.get("type") == "SOLID" and f.get("visible", True):
+                        c = f.get("color", {})
+                        r = int(c.get("r", 1) * 255)
+                        g = int(c.get("g", 1) * 255)
+                        b = int(c.get("b", 1) * 255)
+                        hex_color = f"{r:02x}{g:02x}{b:02x}"
+                        break
+
+                details.append({
+                    "content": chars.strip()[:80],
+                    "x": int(bx), "y": int(by),
+                    "fontSize": fs,
+                    "fontWeight": fw,
+                    "lineHeight": round(float(lh), 1) if lh else "",
+                    "color": hex_color,
+                })
+            for child in n.children:
+                _walk(child)
+
+        _walk(node)
+        return details
 
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -4758,7 +5027,7 @@ body {
   padding: 0;
 }
 '''
-        with open(app_dir / "globals.css", "w", encoding="utf-8") as f:
+        with open(app_dir / "globals.css", "w", encoding="utf-8", newline="\n") as f:
             f.write(globals_css)
 
         # Generate layout.tsx
@@ -4785,7 +5054,7 @@ export default function RootLayout({
   )
 }
 '''
-        with open(app_dir / "layout.tsx", "w", encoding="utf-8") as f:
+        with open(app_dir / "layout.tsx", "w", encoding="utf-8", newline="\n") as f:
             f.write(layout_code)
 
         # Generate page.tsx that imports all components
@@ -4806,7 +5075,7 @@ export default function Home() {{
   )
 }}
 '''
-        with open(app_dir / "page.tsx", "w", encoding="utf-8") as f:
+        with open(app_dir / "page.tsx", "w", encoding="utf-8", newline="\n") as f:
             f.write(page_code)
 
         # Ensure src/components exists (should already exist from convert())

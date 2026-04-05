@@ -2,12 +2,14 @@ import React, { useState, useEffect } from 'react'
 import { CommandBar } from './CommandBar'
 import { Results } from './Results'
 import { Settings } from './Settings'
+import { FigmaWorkflow } from './FigmaWorkflow'
 import './styles.css'
 
 export function App() {
-  const [view, setView] = useState<'command' | 'results' | 'settings'>('command')
+  const [view, setView] = useState<'command' | 'results' | 'settings' | 'figma'>('command')
   const [result, setResult] = useState<any>(null)
   const [context, setContext] = useState<any>(null)
+  const [figmaUrl, setFigmaUrl] = useState('')
 
   useEffect(() => {
     // Listen for context updates
@@ -19,6 +21,11 @@ export function App() {
   }, [])
 
   const handleExecute = async (command: string) => {
+    if (command.includes('figma.com/design')) {
+      setFigmaUrl(command.trim())
+      setView('figma')
+      return
+    }
     try {
       const result = await window.electron.executeCommand(command)
       setResult(result)
@@ -61,6 +68,13 @@ export function App() {
       {view === 'settings' && (
         <Settings
           onBack={handleBack}
+        />
+      )}
+
+      {view === 'figma' && (
+        <FigmaWorkflow
+          figmaUrl={figmaUrl}
+          onBack={() => { setView('command'); setFigmaUrl('') }}
         />
       )}
     </div>

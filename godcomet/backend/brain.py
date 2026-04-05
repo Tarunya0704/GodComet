@@ -80,6 +80,7 @@ class WorkflowRequest(BaseModel):
     """Request to start a Figma-to-production workflow"""
     figma_url: str
     project_name: Optional[str] = None
+    frame_id: Optional[str] = None  # specific frame to convert (node-id)
 
 
 class ApprovalRequest(BaseModel):
@@ -418,15 +419,399 @@ async def get_features():
 # WORKFLOW ENDPOINTS - Real-time Figma-to-Production Pipeline
 # =============================================================================
 
+class FramesRequest(BaseModel):
+    figma_url: str
+
+
+@app.post("/workflow/frames")
+async def list_frames(request: FramesRequest):
+    """Return all top-level frames in a Figma file for the user to choose from."""
+    file_id = _parse_file_id(request.figma_url)
+    figma_token = os.getenv("FIGMA_TOKEN", "").strip()
+    if not figma_token:
+        raise HTTPException(status_code=500, detail="FIGMA_TOKEN not configured")
+
+    figma_data = _load_figma_data(file_id, figma_token)
+
+    frames = []
+    doc = figma_data.get("document", {})
+    for page in doc.get("children", []):
+        for child in page.get("children", []):
+            if child.get("type") == "FRAME" and child.get("visible", True) is not False:
+                bb = child.get("absoluteBoundingBox", {})
+                frames.append({
+                    "id": child.get("id", ""),
+                    "name": child.get("name", "Untitled"),
+                    "width": int(bb.get("width", child.get("size", {}).get("x", 0))),
+                    "height": int(bb.get("height", child.get("size", {}).get("y", 0))),
+                    "page": page.get("name", ""),
+                })
+
+    return {"frames": frames, "file_name": figma_data.get("name", "")}
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for section endpoints
+# ---------------------------------------------------------------------------
+
+def _load_figma_data(file_id: str, figma_token: str) -> dict:
+    """Load Figma file from 1-hour disk cache or live API. Raises HTTPException."""
+    import json as _j, time as _t, requests as _r
+    cache_dir = Path(__file__).parent.parent.parent / "mcp-automation" / "figma_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{file_id}.json"
+    if cache_file.exists() and (_t.time() - cache_file.stat().st_mtime) < 3600:
+        try:
+            return _j.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    resp = _r.get(
+        f"https://api.figma.com/v1/files/{file_id}",
+        headers={"X-Figma-Token": figma_token},
+        timeout=30,
+    )
+    if resp.status_code == 429:
+        raise HTTPException(status_code=429, detail="Figma rate limit — try again shortly")
+    if resp.status_code == 403:
+        raise HTTPException(status_code=403, detail="Figma 403 — check FIGMA_TOKEN")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Figma API {resp.status_code}")
+    data = resp.json()
+    cache_file.write_text(_j.dumps(data), encoding="utf-8")
+    return data
+
+
+def _find_node_by_id(node, target_id: str):
+    """Walk a FigmaNode tree and return the node whose id matches target_id.
+    Normalises both to colon format so URL hyphens (1-514) match API colons (1:514)."""
+    norm = target_id.replace("-", ":").replace("_", ":")
+    if (node.id or "").replace("-", ":").replace("_", ":") == norm:
+        return node
+    for child in node.children:
+        found = _find_node_by_id(child, target_id)
+        if found:
+            return found
+    return None
+
+
+def _parse_file_id(figma_url: str) -> str:
+    import re as _re
+    m = _re.search(r'/(?:design|file)/([a-zA-Z0-9]+)', figma_url)
+    if not m:
+        raise HTTPException(status_code=400, detail="Cannot extract file_id from Figma URL")
+    return m.group(1)
+
+
+def _frame_screenshot_path(file_id: str, frame_id: str) -> Optional[Path]:
+    """Return path to cached frame screenshot, or None if not yet rendered."""
+    safe = frame_id.replace(":", "_").replace("-", "_").replace(";", "_")
+    p = (
+        Path(__file__).parent.parent.parent
+        / "mcp-automation" / "image_cache" / file_id / f"frame_{safe}.png"
+    )
+    return p if p.exists() and p.stat().st_size > 10_000 else None
+
+
+def _crop_to_b64(img, crop_box) -> Optional[str]:
+    """Crop a PIL image to crop_box (x,y,w,h), scale to ≤512px wide, return data URI."""
+    try:
+        import base64 as _b64, io as _io
+        x, y, w, h = crop_box
+        region = img.crop((x, y, x + w, y + h))
+        if region.width > 512:
+            scale = 512 / region.width
+            region = region.resize(
+                (512, max(1, int(region.height * scale))),
+                resample=2,  # LANCZOS
+            )
+        buf = _io.BytesIO()
+        region.save(buf, format="PNG", optimize=True)
+        return "data:image/png;base64," + _b64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# POST /workflow/sections
+# ---------------------------------------------------------------------------
+
+class SectionsRequest(BaseModel):
+    figma_url: str
+    frame_id: str
+
+
+@app.post("/workflow/sections")
+async def list_sections(request: SectionsRequest):
+    """Decompose a Figma frame into semantic components and return them with thumbnail crops."""
+    file_id = _parse_file_id(request.figma_url)
+    figma_token = os.getenv("FIGMA_TOKEN", "").strip()
+    if not figma_token:
+        raise HTTPException(status_code=500, detail="FIGMA_TOKEN not configured")
+
+    figma_data = _load_figma_data(file_id, figma_token)
+
+    # Build FigmaNode tree
+    try:
+        from tools.production_figma_converter import FigmaNode
+        from tools.component_decomposer import ComponentDecomposer
+    except ImportError:
+        from production_figma_converter import FigmaNode
+        from component_decomposer import ComponentDecomposer
+
+    root = FigmaNode(figma_data.get("document", {}))
+    frame = _find_node_by_id(root, request.frame_id)
+    if frame is None:
+        raise HTTPException(status_code=404, detail=f"Frame {request.frame_id!r} not found in file")
+
+    specs = ComponentDecomposer().decompose(frame)
+
+    # Load frame screenshot for thumbnails (optional — graceful if missing)
+    frame_img = None
+    frame_path = _frame_screenshot_path(file_id, request.frame_id)
+    if frame_path:
+        try:
+            from PIL import Image as _PILImage
+            frame_img = _PILImage.open(str(frame_path))
+            logger.info(f"[SECTIONS] Frame screenshot loaded: {frame_img.size}")
+        except Exception as e:
+            logger.warning(f"[SECTIONS] Could not load frame screenshot: {e}")
+
+    scale_x = (frame_img.width / max(frame.width, 1)) if frame_img else 1.0
+    scale_y = (frame_img.height / max(frame.height, 1)) if frame_img else 1.0
+
+    sections = []
+    for spec in specs:
+        x, y, w, h = spec.crop_box
+        # Scale crop_box to screenshot pixel space
+        sx = int(x * scale_x); sy = int(y * scale_y)
+        sw = max(1, int(w * scale_x)); sh = max(1, int(h * scale_y))
+        if frame_img:
+            sx = min(sx, frame_img.width - 1); sy = min(sy, frame_img.height - 1)
+            sw = min(sw, frame_img.width - sx); sh = min(sh, frame_img.height - sy)
+        thumb = _crop_to_b64(frame_img, (sx, sy, sw, sh)) if frame_img else None
+
+        sections.append({
+            "id": spec.node.id,
+            "name": spec.name,
+            "width": int(spec.node.width),
+            "height": int(spec.node.height),
+            "y_position": y,
+            "is_template": spec.is_template,
+            "instance_count": spec.instance_count,
+            "thumbnail_b64": thumb,
+        })
+
+    return {"sections": sections, "frame_name": frame.name}
+
+
+# ---------------------------------------------------------------------------
+# POST /workflow/generate-section
+# ---------------------------------------------------------------------------
+
+class GenerateSectionRequest(BaseModel):
+    figma_url: str
+    frame_id: str
+    section_id: str
+    project_id: str
+
+
+@app.post("/workflow/generate-section")
+async def generate_section(request: GenerateSectionRequest):
+    """Generate a single component from a Figma section and write it to an existing project."""
+    file_id = _parse_file_id(request.figma_url)
+    figma_token = os.getenv("FIGMA_TOKEN", "").strip()
+    if not figma_token:
+        raise HTTPException(status_code=500, detail="FIGMA_TOKEN not configured")
+
+    figma_data = _load_figma_data(file_id, figma_token)
+
+    try:
+        from tools.production_figma_converter import FigmaNode, ProductionFigmaToCode
+        from tools.component_decomposer import ComponentDecomposer
+    except ImportError:
+        from production_figma_converter import FigmaNode, ProductionFigmaToCode
+        from component_decomposer import ComponentDecomposer
+
+    root = FigmaNode(figma_data.get("document", {}))
+    frame = _find_node_by_id(root, request.frame_id)
+    if frame is None:
+        raise HTTPException(status_code=404, detail=f"Frame {request.frame_id!r} not found")
+
+    specs = ComponentDecomposer().decompose(frame)
+    # Find the target spec by section_id (normalised)
+    spec = next(
+        (s for s in specs
+         if _find_node_by_id(s.node, request.section_id) is not None
+         or s.node.id.replace("-", ":") == request.section_id.replace("-", ":")),
+        None,
+    )
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Section {request.section_id!r} not found in decomposition")
+
+    # Sanitize component name (same rule as _convert_decomposed)
+    import re as _re
+    spec.name = _re.sub(r'[^a-zA-Z0-9]', '', spec.name)
+    if spec.name and not spec.name[0].isupper():
+        spec.name = spec.name[0].upper() + spec.name[1:]
+    if not spec.name:
+        spec.name = "Component"
+
+    # Locate project directory
+    projects_root = Path(__file__).parent.parent.parent / "mcp-automation" / "projects"
+    project_dir = projects_root / request.project_id
+    if not project_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id!r} not found at {project_dir}")
+
+    components_dir = project_dir / "src" / "components"
+    components_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rebuild image_map from existing public/images/ files
+    # Files are named {node_id_safe}.png — reverse-map to node.id (colon form)
+    images_dir = project_dir / "public" / "images"
+    image_map: dict = {}
+    if images_dir.exists():
+        for img_file in images_dir.glob("*.png"):
+            stem = img_file.stem                           # e.g. "1_3951"
+            node_id_colon = stem.replace("_", ":", 1)     # best-effort reverse
+            image_map[node_id_colon] = f"/images/{img_file.name}"
+            image_map[stem] = f"/images/{img_file.name}"  # also map safe key directly
+
+    # Crop frame screenshot for this component
+    crops_dir = project_dir / "_crops"
+    crops_dir.mkdir(exist_ok=True)
+    cropped_path: Optional[str] = None
+
+    frame_path = _frame_screenshot_path(file_id, request.frame_id)
+    frame_img = None
+    if frame_path:
+        try:
+            from PIL import Image as _PILImage
+            frame_img = _PILImage.open(str(frame_path))
+        except Exception:
+            pass
+
+    if frame_img:
+        scale_x = frame_img.width / max(frame.width, 1)
+        scale_y = frame_img.height / max(frame.height, 1)
+        try:
+            x, y, w, h = spec.crop_box
+            sx = int(x * scale_x); sy = int(y * scale_y)
+            sw = max(1, int(w * scale_x)); sh = max(1, int(h * scale_y))
+            sx = min(sx, frame_img.width - 1); sy = min(sy, frame_img.height - 1)
+            sw = min(sw, frame_img.width - sx); sh = min(sh, frame_img.height - sy)
+            if sw > 0 and sh > 0:
+                region = frame_img.crop((sx, sy, sx + sw, sy + sh))
+                # Upscale to ≥1024px wide for Claude's benefit
+                if region.width < 1024:
+                    scale = 1024 / region.width
+                    region = region.resize(
+                        (1024, max(1, int(region.height * scale))),
+                        resample=1,  # LANCZOS
+                    )
+                crop_file = crops_dir / f"{spec.name}_crop.png"
+                region.save(str(crop_file))
+                cropped_path = str(crop_file)
+        except Exception as _e:
+            logger.warning(f"[GEN-SECTION] Crop failed: {_e}")
+
+    # Generate the component via Claude
+    converter = ProductionFigmaToCode(figma_token)
+    loop = asyncio.get_event_loop()
+    code = await loop.run_in_executor(
+        None,
+        lambda: converter._generate_decomposed_component(spec, cropped_path, image_map),
+    )
+    if not code:
+        # Programmatic fallback
+        code = converter.code_generator.generate_component(spec.node, spec.name, image_map)
+
+    # Normalize whitespace and write
+    code = _re.sub(r'(return\s*\()[ \t]+(<)', r'\1\n    \2', code)
+    comp_file = components_dir / f"{spec.name}.tsx"
+    comp_file.write_text(code, encoding="utf-8")
+    logger.info(f"[GEN-SECTION] ✅ Wrote {comp_file.name} ({len(code)} chars)")
+
+    # Return cropped design screenshot as preview
+    preview_b64 = None
+    if frame_img:
+        x, y, w, h = spec.crop_box
+        preview_b64 = _crop_to_b64(frame_img, (
+            int(x * scale_x), int(y * scale_y),
+            max(1, int(w * scale_x)), max(1, int(h * scale_y)),
+        ))
+
+    return {
+        "component_name": spec.name,
+        "file_path": str(comp_file.relative_to(project_dir)),
+        "code_length": len(code),
+        "preview_b64": preview_b64,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /workflow/rerender
+# ---------------------------------------------------------------------------
+
+class RerenderRequest(BaseModel):
+    project_id: str
+    viewport_width: int = 1280
+    viewport_height: int = 800
+
+
+@app.post("/workflow/rerender")
+async def rerender_project(request: RerenderRequest):
+    """Re-run the render step on an existing project and return a screenshot b64."""
+    projects_root = Path(__file__).parent.parent.parent / "mcp-automation" / "projects"
+    project_dir = projects_root / request.project_id
+    if not project_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id!r} not found")
+
+    try:
+        from tools.render_engine import RenderEngine
+    except ImportError:
+        try:
+            from render_engine import RenderEngine
+        except ImportError:
+            raise HTTPException(status_code=500, detail="RenderEngine not available")
+
+    engine = RenderEngine()
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: engine.render_project(
+                str(project_dir),
+                viewport_width=request.viewport_width,
+                viewport_height=request.viewport_height,
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Render failed: {e}")
+
+    screenshot_path = result.get("screenshot_path") if isinstance(result, dict) else None
+    if not screenshot_path or not Path(screenshot_path).exists():
+        raise HTTPException(status_code=500, detail="Render did not produce a screenshot")
+
+    import base64 as _b64
+    screenshot_b64 = _b64.b64encode(Path(screenshot_path).read_bytes()).decode()
+    return {"screenshot_b64": screenshot_b64}
+
+
 @app.post("/workflow/start")
 async def start_workflow(request: WorkflowRequest):
     """Start a new Figma-to-production workflow and execute the full pipeline"""
     try:
-        logger.info(f"🚀 Starting workflow for: {request.figma_url}")
+        figma_url = request.figma_url
+        # Append node-id so the converter targets a specific frame
+        if request.frame_id:
+            separator = "&" if "?" in figma_url else "?"
+            figma_url = f"{figma_url}{separator}node-id={request.frame_id}"
+            logger.info(f"🎯 Frame targeted: {request.frame_id}")
+        logger.info(f"🚀 Starting workflow for: {figma_url}")
 
         # Start workflow execution (runs in background)
         workflow = await workflow_executor.start_workflow(
-            figma_url=request.figma_url,
+            figma_url=figma_url,
             project_name=request.project_name
         )
 

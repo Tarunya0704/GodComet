@@ -147,7 +147,8 @@ class WorkflowContext:
             "github_url": self.github_url,
             "vercel_url": self.vercel_url,
             "error": self.error,
-            "total_duration": self.total_duration
+            "total_duration": self.total_duration,
+            "figma_metadata": self.figma_metadata
         }
 
 

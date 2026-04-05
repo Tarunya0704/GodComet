@@ -151,6 +151,27 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('deploy-approval-required', (event, data) => {
       callback(data);
     });
+  },
+
+  // ============================================================================
+  // FIGMA PICKER APIs — frame browser + section selector
+  // ============================================================================
+
+  getFigmaFrames: (figmaUrl) => {
+    return ipcRenderer.invoke('get-figma-frames', figmaUrl);
+  },
+
+  getFigmaSections: (figmaUrl, frameId) => {
+    return ipcRenderer.invoke('get-figma-sections', figmaUrl, frameId);
+  },
+
+  startWorkflowWithFrame: (figmaUrl, frameId, sectionIds) => {
+    return ipcRenderer.invoke('start-workflow-with-frame', figmaUrl, frameId, sectionIds);
+  },
+
+  // Regenerate a single section component and re-render the project
+  regenerateSection: (figmaUrl, frameId, sectionId, projectId) => {
+    return ipcRenderer.invoke('regenerate-section', figmaUrl, frameId, sectionId, projectId);
   }
 });
 
