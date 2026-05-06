@@ -299,9 +299,50 @@ class VisualAuditor:
         rendered_path: str,
         figma_metadata: Optional[Dict]
     ) -> Dict:
-        """Pixel-diff score using pixelmatch — deterministic, no API calls."""
-        score, issues = self._pixel_diff_score(figma_path, rendered_path)
-        return {"score": score, "issues": issues}
+        """Pixel-diff score + optional Claude/Groq issue extraction for healer feedback."""
+        pixel_score, _ = self._pixel_diff_score(figma_path, rendered_path)
+
+        # If Anthropic available and score is below 90%, run vision analysis to get specific issues
+        issues: List[Dict] = []
+        if pixel_score < 0.90 and self.anthropic_client:
+            try:
+                figma_b64 = self._encode_image(figma_path, max_width=1024)
+                rendered_b64 = self._encode_image(rendered_path, max_width=1024)
+                prompt = (
+                    "Compare these two UI screenshots (Figma design vs rendered code) and list every visual difference.\n"
+                    "For EACH difference output a JSON object like:\n"
+                    '{"type":"color_mismatch","element":"sidebar background","severity":"critical","expected":"#1a1a2e","actual":"#ffffff","fix":"change bg-white to bg-[#1a1a2e]"}\n\n'
+                    "severity: 'critical' for missing elements or wrong layout, 'major' for wrong colors/sizes, 'minor' for spacing.\n"
+                    "Return ONLY a JSON array of issue objects. No text, no markdown."
+                )
+                response = self.anthropic_client.messages.create(
+                    model=self.anthropic_model,
+                    max_tokens=2048,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Target Figma design:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": figma_b64}},
+                            {"type": "text", "text": "Rendered code output:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": rendered_b64}},
+                            {"type": "text", "text": prompt},
+                        ]
+                    }]
+                )
+                raw = response.content[0].text.strip()
+                # Strip markdown fences
+                if "```" in raw:
+                    m = re.search(r'```(?:json)?\n?(.*?)```', raw, re.DOTALL)
+                    if m:
+                        raw = m.group(1).strip()
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    issues = parsed
+                    logger.info(f"[AUDIT] Claude vision found {len(issues)} issues")
+            except Exception as e:
+                logger.warning(f"[AUDIT] Claude vision issue analysis failed: {e}")
+
+        return {"score": pixel_score, "issues": issues}
 
     def _pixel_diff_score(self, figma_path: str, rendered_path: str) -> Tuple[float, List]:
         """Compare two images with pixelmatch (PIL contrib) and return (match_ratio, [])."""

@@ -4128,7 +4128,11 @@ class ProductionFigmaToCode:
                     logger.warning(f"[DECOMPOSE] {spec.name}: retry also failed — using programmatic fallback")
                     code = self.code_generator.generate_component(spec.node, spec.name, image_map)
 
-            # 4. Save — normalize CRLF and ensure React import exists
+            # 4. Strip duplicate function definitions (e.g. Claude wraps with
+            #    `export default function Foo() { return <Foo /> }` after defining Foo above)
+            code = self._remove_duplicate_function(code, spec.name)
+
+            # 5. Save — normalize CRLF and ensure React import exists
             code = code.replace('\r\n', '\n').replace('\r', '\n')
             if not code.startswith("import React"):
                 code = "import React from 'react'\n\n" + code
@@ -4204,6 +4208,16 @@ class ProductionFigmaToCode:
             "- Match the screenshot exactly: colors, spacing, typography, borders, shadows\n"
             "- Apply the exact font-size, font-weight, color, and line-height from the TEXT NODES block\n"
             "- Use exact hex colors from the node description\n"
+            "- NODE DESCRIPTION FIELDS — translate them literally:\n"
+            "  * layout=HORIZONTAL → flex flex-row; layout=VERTICAL → flex flex-col\n"
+            "  * gap=N → gap-[Npx]; padding=(top,right,bottom,left) → pt-[Npx] pr-[Npx] pb-[Npx] pl-[Npx]\n"
+            "  * main=CENTER → justify-center; main=SPACE_BETWEEN → justify-between; main=MIN → justify-start; main=MAX → justify-end\n"
+            "  * cross=CENTER → items-center; cross=MIN → items-start; cross=MAX → items-end\n"
+            "  * bg=#rrggbb → bg-[#rrggbb]; bg=rgba(r,g,b,a) → use inline style={{backgroundColor:'rgba(r,g,b,a)'}}\n"
+            "  * gradient=linear(...) → use inline style={{background:'linear-gradient(135deg,#from,#to)'}}\n"
+            "  * rounded=N → rounded-[Npx]; border=Wpx-#color → border border-[Wpx] border-[#color]\n"
+            "  * color=#rrggbb on TEXT node → text-[#rrggbb]; size=N → text-[Npx]; weight=N → font-[N]\n"
+            "  * lh=Npx → leading-[Npx]; ls=N → tracking-[Nem]\n"
             "- If the component has an image with text overlaid: use relative on the container, absolute on the text\n"
             "- Escape { } inside JSX text with &#123; &#125;\n"
             "- ALL tags must be properly closed; ALL parentheses must be balanced"
@@ -4338,7 +4352,7 @@ RULES:
 - Each UI element should appear ONCE — do not render both a text node AND a button/link for the same action (e.g. if the tree has a "View" text inside a button container, render only ONE clickable element)
 - Follow the tree structure exactly — if a node appears as a child of another, do NOT also render it separately at a higher level
 - If a child group contains an icon + label, render them as a single flex row, not as separate elements
-- The export MUST be exactly: export default function {spec.name}() (name is case-sensitive)
+- Define the component as a SINGLE declaration: `export default function {spec.name}() {{` — do NOT define `function {spec.name}()` separately then add a wrapper
 - Return ONLY the code, no markdown fences, no explanation{extra_instruction}"""
 
         # User message: text + optional screenshot crop
@@ -4363,8 +4377,10 @@ RULES:
             {"role": "user", "content": user_content},
         ]
 
+        # Use more tokens for complex components to avoid truncation
+        _max_tokens = 6144 if tree_len > 3000 else 4096
         if self.ai_generator.anthropic_client:
-            raw = self.ai_generator._call_claude(messages, max_tokens=4096, model=_chosen_model)
+            raw = self.ai_generator._call_claude(messages, max_tokens=_max_tokens, model=_chosen_model)
         else:
             # Groq text-only fallback
             try:
@@ -4392,6 +4408,30 @@ RULES:
         if "```" in code:
             code = code[:code.rfind("```")]
         return code.strip()
+
+    @staticmethod
+    def _remove_duplicate_function(code: str, name: str) -> str:
+        """Remove a wrapper pattern Claude sometimes adds at the end:
+            export default function Foo() { return <Foo /> }
+        when `function Foo()` is already defined earlier in the file.
+        """
+        # Pattern: find a second function declaration with the same name
+        pattern = (
+            r'\nexport\s+default\s+function\s+' + re.escape(name) +
+            r'\s*\(\s*\)\s*\{[^}]*\}'
+        )
+        # Only strip if there are 2+ function declarations with this name
+        # (meaning the real component + the wrapper both exist)
+        all_fn = re.findall(r'\bfunction\s+' + re.escape(name) + r'\s*\(', code)
+        if len(all_fn) >= 2:
+            stripped = re.sub(pattern, '', code, flags=re.DOTALL).rstrip()
+            if stripped != code.rstrip():
+                logger.info(f"[REPAIR] Stripped duplicate export default wrapper for {name}")
+                # Ensure there's still an export default
+                if 'export default' not in stripped:
+                    stripped += f'\n\nexport default {name}'
+                return stripped
+        return code
 
     @staticmethod
     def _auto_repair_tsx(code: str, name: str = "") -> str:
@@ -4500,12 +4540,17 @@ RULES:
                         f"        ))}}"
                     )
                 else:
-                    # All instances have identical/empty data — render just once
+                    # All instances have identical/empty data — still render instance_count copies
+                    # so the grid fills visually (e.g. 4 story cards instead of 1)
+                    n = min(spec.instance_count, 12)
                     logger.info(
                         f"[LAYOUT] Template {spec.name} has {spec.instance_count} identical "
-                        f"instances — rendering once"
+                        f"instances — rendering {n} copies"
                     )
-                    inner = f"        <{spec.name} />"
+                    inner = "\n".join(
+                        f"          <{spec.name} key={{{i}}} />"
+                        for i in range(n)
+                    )
                 render_str = (
                     f'      <div className="{grid_cls} w-full items-start overflow-hidden">\n'
                     + inner + "\n"
@@ -4598,22 +4643,51 @@ RULES:
         h = int(node.height)
         line = f'{indent}{type_str} "{name}" {w}x{h}'
 
-        # Layout
+        # Layout mode + alignment + gap + padding
         layout = raw.get("layoutMode")
         if layout and layout != "NONE":
             gap = raw.get("itemSpacing", 0)
+            align_main = raw.get("primaryAxisAlignItems", "")
+            align_cross = raw.get("counterAxisAlignItems", "")
             line += f" layout={layout} gap={gap}"
+            if align_main:
+                line += f" main={align_main}"
+            if align_cross:
+                line += f" cross={align_cross}"
+            # Padding — critical for accurate spacing
+            pl = raw.get("paddingLeft", 0)
+            pr = raw.get("paddingRight", 0)
+            pt = raw.get("paddingTop", 0)
+            pb = raw.get("paddingBottom", 0)
+            if any([pl, pr, pt, pb]):
+                line += f" padding=({pt},{pr},{pb},{pl})"  # top,right,bottom,left
 
-        # Background color (first solid fill)
+        # Background color (solid fill or gradient)
         fills = raw.get("fills", [])
         if isinstance(fills, list):
             for f in fills:
-                if isinstance(f, dict) and f.get("type") == "SOLID" and f.get("visible", True):
+                if not isinstance(f, dict) or not f.get("visible", True):
+                    continue
+                if f.get("type") == "SOLID":
                     c = f.get("color", {})
                     r, g, b = int(c.get("r", 0) * 255), int(c.get("g", 0) * 255), int(c.get("b", 0) * 255)
-                    line += f" bg=#{r:02x}{g:02x}{b:02x}"
+                    a = f.get("opacity", c.get("a", 1.0))
+                    if a < 0.99:
+                        line += f" bg=rgba({r},{g},{b},{a:.2f})"
+                    else:
+                        line += f" bg=#{r:02x}{g:02x}{b:02x}"
                     break
-                if isinstance(f, dict) and f.get("type") == "IMAGE" and f.get("visible", True):
+                if f.get("type") == "GRADIENT_LINEAR":
+                    stops = f.get("gradientStops", [])
+                    stop_parts = []
+                    for s in stops[:3]:
+                        c = s.get("color", {})
+                        sr, sg, sb = int(c.get("r", 0) * 255), int(c.get("g", 0) * 255), int(c.get("b", 0) * 255)
+                        pos = int(s.get("position", 0) * 100)
+                        stop_parts.append(f"#{sr:02x}{sg:02x}{sb:02x}@{pos}%")
+                    line += f" gradient=linear({','.join(stop_parts)})"
+                    break
+                if f.get("type") == "IMAGE":
                     ref = f.get("imageRef", "")
                     img_path = image_map.get(ref, image_map.get(node.id, ""))
                     if img_path:
@@ -4622,22 +4696,58 @@ RULES:
                         line += " image=<fill>"
                     break
 
+        # Stroke / border
+        strokes = raw.get("strokes", [])
+        if isinstance(strokes, list):
+            for s in strokes:
+                if isinstance(s, dict) and s.get("type") == "SOLID" and s.get("visible", True):
+                    c = s.get("color", {})
+                    sr, sg, sb = int(c.get("r", 0) * 255), int(c.get("g", 0) * 255), int(c.get("b", 0) * 255)
+                    sw = raw.get("strokeWeight", 1)
+                    line += f" border={sw}px-#{sr:02x}{sg:02x}{sb:02x}"
+                    break
+
         # Corner radius
         radius = raw.get("cornerRadius")
+        if not radius:
+            # individual corners
+            tl = raw.get("rectangleTopLeftRadius", 0)
+            tr = raw.get("rectangleTopRightRadius", 0)
+            bl = raw.get("rectangleBottomLeftRadius", 0)
+            br = raw.get("rectangleBottomRightRadius", 0)
+            if any([tl, tr, bl, br]):
+                radius = f"{tl}/{tr}/{br}/{bl}"
         if radius:
             line += f" rounded={radius}"
 
-        # Text node: content + typography
+        # Text node: content + full typography
         if type_str == "TEXT":
             chars = raw.get("characters", "")
             style = raw.get("style", {})
             fs = style.get("fontSize", "")
             fw = style.get("fontWeight", "")
+            lh_val = style.get("lineHeightPx") or style.get("lineHeightValue")
+            ls = style.get("letterSpacing")
+            align = style.get("textAlignHorizontal", "")
             line += f' text="{chars[:80]}"'
             if fs:
                 line += f" size={fs}"
             if fw:
                 line += f" weight={fw}"
+            if lh_val:
+                line += f" lh={lh_val:.0f}px"
+            if ls and ls != 0:
+                line += f" ls={ls:.1f}"
+            if align and align != "LEFT":
+                line += f" align={align}"
+            # Text color from fills
+            text_fills = raw.get("fills", [])
+            for tf in text_fills if isinstance(text_fills, list) else []:
+                if isinstance(tf, dict) and tf.get("type") == "SOLID" and tf.get("visible", True):
+                    c = tf.get("color", {})
+                    tr2, tg, tb = int(c.get("r", 0) * 255), int(c.get("g", 0) * 255), int(c.get("b", 0) * 255)
+                    line += f" color=#{tr2:02x}{tg:02x}{tb:02x}"
+                    break
 
         # Clipping / opacity
         if raw.get("clipsContent"):

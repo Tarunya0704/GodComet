@@ -133,20 +133,28 @@ class SelfHealer:
 
         user_prompt = (
             f"Issues found by visual audit:\n{issues_text}\n\n"
-            "Fix the code to close the gap between the two images. "
+            "Compare the two images carefully and fix EVERY visual difference. "
+            "Approach:\n"
+            "1. Background colors — if a section has a different background, fix bg-[#hex]\n"
+            "2. Text colors — compare every text element, fix text-[#hex]\n"
+            "3. Spacing — compare padding and gaps, use pt-[Npx] pl-[Npx] gap-[Npx]\n"
+            "4. Sizes — compare widths/heights of cards and containers, use w-[Npx] h-[Npx]\n"
+            "5. Font sizes and weights — fix text-[Npx] font-[N] to match\n"
+            "6. Border radius — fix rounded-[Npx] to match\n"
+            "7. Shadows — use shadow-[0px_Npx_Npx_rgba(0,0,0,0.N)] if needed\n"
+            "8. Layout direction — flex-row vs flex-col, justify-center vs justify-between\n"
             "Rules:\n"
             "- Use arbitrary Tailwind values for exact measurements "
             "(gap-[13px], text-[#2D3748], w-[280px])\n"
             "- Do not change component structure or add/remove elements\n"
-            "- Fix: spacing, padding, margins, colors, font sizes, alignment, "
-            "border radius, shadows\n"
-            "- Return ONLY the complete fixed code, no explanation\n\n"
+            "- Do not add comments or explanations\n"
+            "- Return ONLY the complete fixed TSX code\n\n"
             f"Current code:\n{current_code}"
         )
 
         system_text = (
-            "You are a pixel-perfect frontend developer. "
-            "Output ONLY raw TSX — no markdown fences, no explanation."
+            "You are a pixel-perfect frontend developer specializing in matching Figma designs exactly. "
+            "Output ONLY raw TSX — no markdown fences, no explanation, no comments."
         )
         # Anthropic format (primary)
         anthropic_messages = [
@@ -222,18 +230,44 @@ class SelfHealer:
             # NOTE: brace-balance check removed — TSX has legitimately unequal { } counts
             # inside string literals and JSX attributes.
             if "export default" not in code:
-                print(
-                    f"⚠️  SelfHealer.fix_with_vision: output missing export default — discarding. "
-                    f"Last 200: {code[-200:]!r}"
+                # Try to recover: if there's a function declaration matching the component name,
+                # append the export default rather than discarding the whole output.
+                fn_pattern = re.search(
+                    rf'(function\s+{re.escape(component_name)}\s*\()',
+                    code,
                 )
-                return None
+                if fn_pattern:
+                    code = code + f"\n\nexport default {component_name}"
+                    print(
+                        f"⚠️  SelfHealer.fix_with_vision: appended missing export default for {component_name}"
+                    )
+                else:
+                    print(
+                        f"⚠️  SelfHealer.fix_with_vision: output missing export default — discarding. "
+                        f"Last 200: {code[-200:]!r}"
+                    )
+                    return None
             _last = code.rstrip()[-1] if code.rstrip() else ""
             if _last not in ("}", ";"):
-                print(
-                    f"⚠️  SelfHealer.fix_with_vision: output truncated (last char={_last!r}) — discarding. "
-                    f"Last 200: {code[-200:]!r}"
-                )
-                return None
+                # Truncated output — try to close any open braces/parens before discarding
+                open_braces = code.count("{") - code.count("}")
+                open_parens = code.count("(") - code.count(")")
+                recovery = ""
+                if open_parens > 0:
+                    recovery += ")" * open_parens
+                if open_braces > 0:
+                    recovery += "}" * open_braces
+                if recovery and len(recovery) <= 5:
+                    code = code + "\n" + recovery
+                    print(
+                        f"⚠️  SelfHealer.fix_with_vision: output truncated — appended '{recovery}' to close"
+                    )
+                else:
+                    print(
+                        f"⚠️  SelfHealer.fix_with_vision: output truncated (last char={_last!r}) — discarding. "
+                        f"Last 200: {code[-200:]!r}"
+                    )
+                    return None
 
             print(f"✅ SelfHealer: vision fix produced {len(code)} chars for {component_name}")
             return code
