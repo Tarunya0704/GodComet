@@ -68,7 +68,12 @@ export interface PipelineStageError extends Error {
   stage: string;
 }
 
-export const MIN_SCREENSHOT_BYTES = 100 * 1024; // 100KB — anything smaller is suspect.
+// Originally 100KB (per the spec lifted from GodComet's <100KB-as-broken heuristic),
+// but real-world Next.js minimal pages (e.g. fresh create-next-app default)
+// compress to ~30KB and were getting flagged as suspect. A truly broken/blank
+// 1440×900 PNG is around 5KB. 15KB is the sweet spot: catches blanks but lets
+// minimal real pages through.
+export const MIN_SCREENSHOT_BYTES = 15 * 1024;
 export const PIXELMATCH_THRESHOLD = 0.1; // visual_auditor.py default.
 export const VISUAL_CHANGE_THRESHOLD_PCT = 0.1; // PR threshold for posting a diff.
 export const ASPECT_RATIO_MISMATCH_PCT = 0.10; // visual_auditor.py: >10% → crop.

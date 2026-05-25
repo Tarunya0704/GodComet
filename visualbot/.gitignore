@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.log
+
+# secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+*.pem
+private-key.pem
+
+# scratch artifacts from smoke tests
+diff-out.png
+
+# os
+.DS_Store
+Thumbs.db

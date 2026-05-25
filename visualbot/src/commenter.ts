@@ -54,11 +54,31 @@ async function ensureAssetBranch(
     if (status !== 404) throw err;
   }
 
-  // Create empty tree → orphan commit → branch ref. (No retry-with-force here:
-  // a 422 means the branch was created concurrently, which is benign — we'll
-  // just re-fetch on the next call.)
+  // GitHub's createTree rejects `tree: []` with 422 "Invalid tree info."
+  // Seed the branch with a placeholder README so the initial tree is non-empty.
+  // Sequence: create blob → create tree referencing blob → create orphan commit
+  // → create branch ref.
+  const placeholder =
+    "# VisualBot assets\n\n" +
+    "This branch is auto-managed by VisualBot — it stores before/after/diff " +
+    "PNGs referenced by PR comments. Do not edit manually.\n";
+
+  const { data: blob } = await gh("createBlob", () =>
+    octokit.git.createBlob({
+      owner,
+      repo,
+      content: Buffer.from(placeholder, "utf-8").toString("base64"),
+      encoding: "base64",
+    })
+  );
   const { data: tree } = await gh("createTree", () =>
-    octokit.git.createTree({ owner, repo, tree: [] })
+    octokit.git.createTree({
+      owner,
+      repo,
+      tree: [
+        { path: "README.md", mode: "100644", type: "blob", sha: blob.sha },
+      ],
+    })
   );
   const { data: commit } = await gh("createCommit", () =>
     octokit.git.createCommit({
@@ -69,16 +89,31 @@ async function ensureAssetBranch(
       parents: [],
     })
   );
-  await gh("createRef", () =>
-    octokit.git.createRef({
-      owner,
-      repo,
-      ref: `refs/heads/${ASSET_BRANCH}`,
-      sha: commit.sha,
-    })
-  );
-  log(`[commenter] created orphan branch ${ASSET_BRANCH} on ${owner}/${repo}`);
-  return commit.sha;
+  try {
+    await gh("createRef", () =>
+      octokit.git.createRef({
+        owner,
+        repo,
+        ref: `refs/heads/${ASSET_BRANCH}`,
+        sha: commit.sha,
+      })
+    );
+    log(`[commenter] created orphan branch ${ASSET_BRANCH} on ${owner}/${repo}`);
+    return commit.sha;
+  } catch (err: unknown) {
+    // Race: another concurrent uploadAsset() got here first and created the
+    // branch. GitHub returns 422 with "Reference already exists" — benign,
+    // the branch exists now, which is what we wanted.
+    const e = err as { status?: number; message?: string };
+    if (e.status === 422 && (e.message ?? "").includes("Reference already exists")) {
+      log(`[commenter] branch ${ASSET_BRANCH} was concurrently created — proceeding`);
+      const { data: ref } = await gh("getRef.after-race", () =>
+        octokit.git.getRef({ owner, repo, ref: `heads/${ASSET_BRANCH}` })
+      );
+      return ref.object.sha;
+    }
+    throw err;
+  }
 }
 
 async function uploadAsset(
@@ -225,32 +260,35 @@ export async function postChangeComment(
     const safePath = d.pagePath.replace(/[^a-zA-Z0-9_-]/g, "_") || "root";
     const base = `visualbot/pr-${prNumber}/${headSha}/${safePath}`;
 
-    const [beforeUrl, afterUrl, diffUrl] = await Promise.all([
-      uploadAsset(
-        context.octokit,
-        owner,
-        repo,
-        `${base}/before.png`,
-        d.beforePng,
-        `VisualBot PR#${prNumber} ${d.pagePath} before`
-      ),
-      uploadAsset(
-        context.octokit,
-        owner,
-        repo,
-        `${base}/after.png`,
-        d.afterPng,
-        `VisualBot PR#${prNumber} ${d.pagePath} after`
-      ),
-      uploadAsset(
-        context.octokit,
-        owner,
-        repo,
-        `${base}/diff.png`,
-        d.diff.diffImage,
-        `VisualBot PR#${prNumber} ${d.pagePath} diff`
-      ),
-    ]);
+    // Serialized, not Promise.all: createOrUpdateFileContents advances the
+    // branch HEAD with a new commit each call. Parallel calls race on the
+    // branch sha and only one wins per round-trip, so we'd just collect
+    // 409 conflicts. Three sequential round-trips is ~1s extra latency —
+    // worth it for correctness.
+    const beforeUrl = await uploadAsset(
+      context.octokit,
+      owner,
+      repo,
+      `${base}/before.png`,
+      d.beforePng,
+      `VisualBot PR#${prNumber} ${d.pagePath} before`
+    );
+    const afterUrl = await uploadAsset(
+      context.octokit,
+      owner,
+      repo,
+      `${base}/after.png`,
+      d.afterPng,
+      `VisualBot PR#${prNumber} ${d.pagePath} after`
+    );
+    const diffUrl = await uploadAsset(
+      context.octokit,
+      owner,
+      repo,
+      `${base}/diff.png`,
+      d.diff.diffImage,
+      `VisualBot PR#${prNumber} ${d.pagePath} diff`
+    );
 
     // GodComet's audit returns three independent scores; expose all three so
     // a developer reading the comment can sanity-check pixel-vs-structural

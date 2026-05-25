@@ -210,7 +210,14 @@ export function isRetriableHttpError(err: unknown): boolean {
   const e = err as { status?: number; code?: string; message?: string };
   if (e.status === 429) return true;
   if (e.status && e.status >= 500 && e.status < 600) return true;
-  if (e.code === "ETIMEDOUT" || e.code === "ECONNRESET" || e.code === "ENOTFOUND") return true;
+  // Node-style network errors don't have a status. Only read `.code` in that
+  // case — octokit's RequestError has a deprecated `.code` alias for `.status`
+  // and reading it emits a deprecation warning.
+  if (e.status === undefined) {
+    if (e.code === "ETIMEDOUT" || e.code === "ECONNRESET" || e.code === "ENOTFOUND") {
+      return true;
+    }
+  }
   const msg = (e.message ?? "").toLowerCase();
   if (msg.includes("rate limit") || msg.includes("rate_limit")) return true;
   if (msg.includes("timeout") || msg.includes("timed out")) return true;
