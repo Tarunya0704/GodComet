@@ -246,6 +246,64 @@ function fmtPct(n: number): string {
   return (n * 100).toFixed(2) + "%";
 }
 
+interface AssetUrls {
+  beforeUrl: string;
+  afterUrl: string;
+  diffUrl: string;
+}
+
+function buildSection(d: PageDiff, urls: AssetUrls | null): string {
+  const flags: string[] = [];
+  if (d.diff.aspectRatioCropApplied) flags.push("✂ AR-cropped");
+  if (d.diff.dimensionMismatch) flags.push("📐 dim-normalized");
+  if (d.diff.suspectedInvalidInput) flags.push("⚠ small-screenshot");
+  const flagLine = flags.length ? `\n_${flags.join(" · ")}_` : "";
+
+  // GodComet's audit returns three independent scores; expose all three so a
+  // developer reading the comment can sanity-check pixel-vs-structural
+  // disagreement (e.g. font swap → big SSIM drop, small pixel change).
+  const metricsLine =
+    `**Pixel change: ${d.diff.percentChanged.toFixed(2)}%** ` +
+    `(${d.diff.changedPixels.toLocaleString()} of ${d.diff.totalPixels.toLocaleString()} px) · ` +
+    `**SSIM:** ${fmtPct(d.diff.ssimScore)} · ` +
+    `**Pixel sim:** ${fmtPct(d.diff.pixelSimilarityScore)} · ` +
+    `**Composite:** ${fmtPct(d.diff.compositeScore)}`;
+
+  const footer =
+    `<sub>Viewport: ${d.viewport.width}×${d.viewport.height} · ` +
+    `Diffed at ${d.diff.width}×${d.diff.height}${flagLine}</sub>`;
+
+  if (urls) {
+    return (
+      `### \`${d.pagePath}\`\n\n` +
+      `| Before | After | Diff |\n` +
+      `|--------|-------|------|\n` +
+      `| ![before](${urls.beforeUrl}) | ![after](${urls.afterUrl}) | ![diff](${urls.diffUrl}) |\n\n` +
+      `${metricsLine}\n\n${footer}\n`
+    );
+  }
+  // Text-only fallback.
+  return `### \`${d.pagePath}\`\n\n${metricsLine}\n\n${footer}\n`;
+}
+
+function buildBody(
+  prNumber: number,
+  sections: string[],
+  uploadError: string | null
+): string {
+  const uploadNote = uploadError
+    ? `\n> ℹ️ Image upload to \`${ASSET_BRANCH}\` failed — showing numbers only.\n> Error: \`${uploadError.slice(0, 200)}\`\n> Confirm the App has **Contents: write** permission.\n\n`
+    : "";
+  return (
+    `## 👁 VisualBot — Visual Change Report\n\n` +
+    `**PR #${prNumber}** has visual changes on ${sections.length} page(s).\n` +
+    uploadNote +
+    sections.join("\n---\n\n") +
+    `\n---\n<sub>VisualBot • Catch visual regressions before they ship · ` +
+    `Scores ported from GodComet's visual auditor (SSIM + pixelmatch + pixel-sim composite).</sub>`
+  );
+}
+
 export async function postChangeComment(
   context: Context<"pull_request">,
   target: CommentTarget,
@@ -255,71 +313,58 @@ export async function postChangeComment(
   const { owner, repo, prNumber } = target;
   const headSha = context.payload.pull_request.head.sha.slice(0, 7);
 
-  const sections: string[] = [];
-  for (const d of diffs) {
-    const safePath = d.pagePath.replace(/[^a-zA-Z0-9_-]/g, "_") || "root";
-    const base = `visualbot/pr-${prNumber}/${headSha}/${safePath}`;
+  // Try to upload all assets first. If anything throws (e.g. "Invalid tree
+  // info," missing Contents:write permission, branch state weirdness), fall
+  // back to a text-only comment with just the scores. A comment with numbers
+  // is more useful than no comment, and the upload note tells the user how
+  // to fix the underlying issue.
+  //
+  // Serialized, not Promise.all: createOrUpdateFileContents advances the
+  // branch HEAD with a new commit each call. Parallel calls race on the
+  // branch sha — three sequential round-trips is ~1s extra latency, worth
+  // it for correctness.
+  let urlsPerDiff: (AssetUrls | null)[] = [];
+  let uploadError: string | null = null;
 
-    // Serialized, not Promise.all: createOrUpdateFileContents advances the
-    // branch HEAD with a new commit each call. Parallel calls race on the
-    // branch sha and only one wins per round-trip, so we'd just collect
-    // 409 conflicts. Three sequential round-trips is ~1s extra latency —
-    // worth it for correctness.
-    const beforeUrl = await uploadAsset(
-      context.octokit,
-      owner,
-      repo,
-      `${base}/before.png`,
-      d.beforePng,
-      `VisualBot PR#${prNumber} ${d.pagePath} before`
-    );
-    const afterUrl = await uploadAsset(
-      context.octokit,
-      owner,
-      repo,
-      `${base}/after.png`,
-      d.afterPng,
-      `VisualBot PR#${prNumber} ${d.pagePath} after`
-    );
-    const diffUrl = await uploadAsset(
-      context.octokit,
-      owner,
-      repo,
-      `${base}/diff.png`,
-      d.diff.diffImage,
-      `VisualBot PR#${prNumber} ${d.pagePath} diff`
-    );
-
-    // GodComet's audit returns three independent scores; expose all three so
-    // a developer reading the comment can sanity-check pixel-vs-structural
-    // disagreement (e.g. font swap → big SSIM drop, small pixel change).
-    const flags: string[] = [];
-    if (d.diff.aspectRatioCropApplied) flags.push("✂ AR-cropped");
-    if (d.diff.dimensionMismatch) flags.push("📐 dim-normalized");
-    if (d.diff.suspectedInvalidInput) flags.push("⚠ small-screenshot");
-    const flagLine = flags.length ? `\n_${flags.join(" · ")}_` : "";
-
-    sections.push(
-      `### \`${d.pagePath}\`\n\n` +
-        `| Before | After | Diff |\n` +
-        `|--------|-------|------|\n` +
-        `| ![before](${beforeUrl}) | ![after](${afterUrl}) | ![diff](${diffUrl}) |\n\n` +
-        `**Pixel change: ${d.diff.percentChanged.toFixed(2)}%** ` +
-        `(${d.diff.changedPixels.toLocaleString()} of ${d.diff.totalPixels.toLocaleString()} px) · ` +
-        `**SSIM:** ${fmtPct(d.diff.ssimScore)} · ` +
-        `**Pixel sim:** ${fmtPct(d.diff.pixelSimilarityScore)} · ` +
-        `**Composite:** ${fmtPct(d.diff.compositeScore)}\n\n` +
-        `<sub>Viewport: ${d.viewport.width}×${d.viewport.height} · ` +
-        `Diffed at ${d.diff.width}×${d.diff.height}${flagLine}</sub>\n`
-    );
+  try {
+    for (const d of diffs) {
+      const safePath = d.pagePath.replace(/[^a-zA-Z0-9_-]/g, "_") || "root";
+      const base = `visualbot/pr-${prNumber}/${headSha}/${safePath}`;
+      const beforeUrl = await uploadAsset(
+        context.octokit,
+        owner,
+        repo,
+        `${base}/before.png`,
+        d.beforePng,
+        `VisualBot PR#${prNumber} ${d.pagePath} before`
+      );
+      const afterUrl = await uploadAsset(
+        context.octokit,
+        owner,
+        repo,
+        `${base}/after.png`,
+        d.afterPng,
+        `VisualBot PR#${prNumber} ${d.pagePath} after`
+      );
+      const diffUrl = await uploadAsset(
+        context.octokit,
+        owner,
+        repo,
+        `${base}/diff.png`,
+        d.diff.diffImage,
+        `VisualBot PR#${prNumber} ${d.pagePath} diff`
+      );
+      urlsPerDiff.push({ beforeUrl, afterUrl, diffUrl });
+    }
+  } catch (err) {
+    // Partial uploads (some succeeded, some didn't) are worse than uniform —
+    // discard whatever we got and post a fully text-only comment.
+    uploadError = err instanceof Error ? err.message : String(err);
+    log(`[commenter] asset upload failed — falling back to text-only: ${uploadError}`);
+    urlsPerDiff = [];
   }
 
-  const body =
-    `## 👁 VisualBot — Visual Change Report\n\n` +
-    `**PR #${prNumber}** has visual changes on ${diffs.length} page(s).\n\n` +
-    sections.join("\n---\n\n") +
-    `\n---\n<sub>VisualBot • Catch visual regressions before they ship · ` +
-    `Scores ported from GodComet's visual auditor (SSIM + pixelmatch + pixel-sim composite).</sub>`;
-
+  const sections = diffs.map((d, i) => buildSection(d, urlsPerDiff[i] ?? null));
+  const body = buildBody(prNumber, sections, uploadError);
   await updateComment(context, target, commentId, body);
 }
