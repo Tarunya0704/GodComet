@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.log
+
+# secrets — must never reach the image
+.env
+.env.local
+.env.*.local
+*.pem
+private-key.pem
+
+# dev/test artifacts
+scripts/
+diff-out.png
+
+# vcs
+.git/
+.gitignore
+
+# os
+.DS_Store
+Thumbs.db
