@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { log, waitForServer, killProcess } from "./utils.js";
 
 export interface RunningServer {
@@ -88,17 +89,22 @@ export async function buildAndStart(
     pm === "npm" ? ["install", "--no-audit", "--no-fund"] : ["install"];
   await runCommand(pm, installArgs, repoDir, env);
 
-  // Ensure Tailwind v4 PostCSS plugin is available — projects often omit it
-  // from package.json when using a framework preset that bundles it, but
-  // Turbopack requires it to be resolvable from the project root.
-  if (!existsSync(join(repoDir, "node_modules", "@tailwindcss", "postcss"))) {
-    log("[builder] @tailwindcss/postcss missing — installing into cloned repo");
-    await runCommand(
-      "npm",
-      ["install", "--no-audit", "--no-fund", "--no-save", "@tailwindcss/postcss"],
-      repoDir,
-      env
-    );
+  // Turbopack resolves PostCSS plugins from the project root. If a project
+  // uses @tailwindcss/postcss (Tailwind v4) but omits it from package.json,
+  // npm won't install it and the build fails. npm install --no-save is
+  // unreliable here because npm considers the package "up to date" when it
+  // finds it nested inside another package's node_modules — but Turbopack
+  // still can't find it. Copying directly from the visualbot's own
+  // node_modules guarantees it lands at the right top-level path.
+  const destTailwindPostcss = join(repoDir, "node_modules", "@tailwindcss", "postcss");
+  if (!existsSync(destTailwindPostcss)) {
+    const visualbotDir = dirname(fileURLToPath(import.meta.url));
+    const srcTailwindPostcss = join(visualbotDir, "../node_modules/@tailwindcss/postcss");
+    if (existsSync(srcTailwindPostcss)) {
+      log("[builder] @tailwindcss/postcss missing — copying from visualbot node_modules");
+      mkdirSync(join(repoDir, "node_modules", "@tailwindcss"), { recursive: true });
+      cpSync(srcTailwindPostcss, destTailwindPostcss, { recursive: true });
+    }
   }
 
   if (scripts.build) {
