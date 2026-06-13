@@ -81,7 +81,14 @@ export async function buildAndStart(
 ): Promise<RunningServer> {
   const pm = detectPackageManager(repoDir);
   const scripts = readScripts(repoDir);
-  const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), CI: "1" };
+  const visualbotDir = dirname(fileURLToPath(import.meta.url));
+  const visualbotModules = join(visualbotDir, "../node_modules");
+  // NODE_PATH lets Turbopack's child processes resolve transitive deps
+  // (e.g. @alloc/quick-lru) from the visualbot's own node_modules when they
+  // are missing from the cloned project.
+  const existingNodePath = process.env.NODE_PATH ?? "";
+  const nodePath = existingNodePath ? `${visualbotModules}:${existingNodePath}` : visualbotModules;
+  const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), CI: "1", NODE_PATH: nodePath };
 
   log(`[builder] using ${pm} in ${repoDir}, PORT=${port}`);
 
@@ -89,17 +96,13 @@ export async function buildAndStart(
     pm === "npm" ? ["install", "--no-audit", "--no-fund"] : ["install"];
   await runCommand(pm, installArgs, repoDir, env);
 
-  // Turbopack resolves PostCSS plugins from the project root. If a project
-  // uses @tailwindcss/postcss (Tailwind v4) but omits it from package.json,
-  // npm won't install it and the build fails. npm install --no-save is
-  // unreliable here because npm considers the package "up to date" when it
-  // finds it nested inside another package's node_modules — but Turbopack
-  // still can't find it. Copying directly from the visualbot's own
-  // node_modules guarantees it lands at the right top-level path.
+  // Copy @tailwindcss/postcss directly into the cloned project's node_modules
+  // so it is resolvable from the project root. NODE_PATH alone is not enough
+  // because postcss.config.js resolution starts from the project directory.
+  // The copy covers the entry point; NODE_PATH covers its transitive deps.
   const destTailwindPostcss = join(repoDir, "node_modules", "@tailwindcss", "postcss");
   if (!existsSync(destTailwindPostcss)) {
-    const visualbotDir = dirname(fileURLToPath(import.meta.url));
-    const srcTailwindPostcss = join(visualbotDir, "../node_modules/@tailwindcss/postcss");
+    const srcTailwindPostcss = join(visualbotModules, "@tailwindcss", "postcss");
     if (existsSync(srcTailwindPostcss)) {
       log("[builder] @tailwindcss/postcss missing — copying from visualbot node_modules");
       mkdirSync(join(repoDir, "node_modules", "@tailwindcss"), { recursive: true });
