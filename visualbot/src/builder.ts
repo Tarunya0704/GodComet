@@ -88,13 +88,17 @@ export async function buildAndStart(
   // are missing from the cloned project.
   const existingNodePath = process.env.NODE_PATH ?? "";
   const nodePath = existingNodePath ? `${visualbotModules}:${existingNodePath}` : visualbotModules;
+  // NODE_ENV=production causes npm to skip devDependencies. The Railway
+  // container sets it globally, so we must unset it for the install step or
+  // packages like @types/react and @tailwindcss/postcss won't be installed.
+  const installEnv: NodeJS.ProcessEnv = { ...process.env, CI: "1", NODE_ENV: "development", NODE_PATH: nodePath };
   const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), CI: "1", NODE_PATH: nodePath };
 
   log(`[builder] using ${pm} in ${repoDir}, PORT=${port}`);
 
   const installArgs =
     pm === "npm" ? ["install", "--no-audit", "--no-fund"] : ["install"];
-  await runCommand(pm, installArgs, repoDir, env);
+  await runCommand(pm, installArgs, repoDir, installEnv);
 
   // Copy @tailwindcss/postcss directly into the cloned project's node_modules
   // so it is resolvable from the project root. NODE_PATH alone is not enough
