@@ -88,6 +88,19 @@ export async function buildAndStart(
     pm === "npm" ? ["install", "--no-audit", "--no-fund"] : ["install"];
   await runCommand(pm, installArgs, repoDir, env);
 
+  // Ensure Tailwind v4 PostCSS plugin is available — projects often omit it
+  // from package.json when using a framework preset that bundles it, but
+  // Turbopack requires it to be resolvable from the project root.
+  if (!existsSync(join(repoDir, "node_modules", "@tailwindcss", "postcss"))) {
+    log("[builder] @tailwindcss/postcss missing — installing into cloned repo");
+    await runCommand(
+      "npm",
+      ["install", "--no-audit", "--no-fund", "--no-save", "@tailwindcss/postcss"],
+      repoDir,
+      env
+    );
+  }
+
   if (scripts.build) {
     log(`[builder] running ${pm} run build`);
     await runCommand(pm, ["run", "build"], repoDir, env);
