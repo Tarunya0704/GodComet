@@ -97,17 +97,64 @@ export function killProcess(proc: ChildProcess | null | undefined): Promise<void
       resolve();
       return;
     }
-    treeKill(proc.pid, "SIGTERM", (err) => {
-      if (err) {
-        logError("tree-kill failed, falling back to proc.kill()", err);
+    const pid = proc.pid;
+
+    const fallbackDirectKill = () => {
+      // On Linux we spawn child processes with `detached: true`, so the child
+      // is its own process-group leader. Killing the negative pid signals the
+      // entire group — equivalent to what tree-kill is trying to do, but
+      // without shelling out to `ps`.
+      try {
+        if (process.platform !== "win32") {
+          process.kill(-pid, "SIGTERM");
+        } else {
+          proc.kill("SIGKILL");
+        }
+      } catch (err) {
+        // Process already dead, or no permission, or pgid doesn't exist.
+        // Either way, our last-ditch try-direct-kill:
         try {
           proc.kill("SIGKILL");
         } catch {
-          // ignore
+          /* give up silently — better than crashing the bot */
         }
       }
+    };
+
+    // tree-kill spawns `ps` internally. If `ps` is missing from the image
+    // (procps not installed), the spawn emits an 'error' event that tree-kill
+    // does NOT catch — it propagates as an uncaughtException and crashes the
+    // whole node process. Guard against that by installing a one-shot
+    // uncaughtException handler around the call, plus the callback fallback.
+    const onUncaught = (err: Error) => {
+      const msg = err.message ?? "";
+      if (msg.includes("spawn ps") || msg.includes("ENOENT")) {
+        logError("tree-kill spawn-ps crash intercepted — using fallback", err);
+        fallbackDirectKill();
+        resolve();
+      } else {
+        // Not ours — rethrow so other handlers (or the default) see it.
+        process.removeListener("uncaughtException", onUncaught);
+        throw err;
+      }
+    };
+    process.once("uncaughtException", onUncaught);
+
+    try {
+      treeKill(pid, "SIGTERM", (err) => {
+        process.removeListener("uncaughtException", onUncaught);
+        if (err) {
+          logError("tree-kill failed, falling back to direct kill", err);
+          fallbackDirectKill();
+        }
+        resolve();
+      });
+    } catch (err) {
+      process.removeListener("uncaughtException", onUncaught);
+      logError("tree-kill threw synchronously, falling back to direct kill", err);
+      fallbackDirectKill();
       resolve();
-    });
+    }
   });
 }
 

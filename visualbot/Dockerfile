@@ -1,8 +1,13 @@
 FROM node:20-slim
 
-# System deps: git for cloning user repos, plus libs Playwright/chromium needs.
+# System deps:
+#   git    — clone user repos
+#   procps — provides `ps`, required by tree-kill to enumerate child PIDs when
+#            we kill the Next.js dev server tree. Without it tree-kill emits
+#            ENOENT and crashes the whole node process.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
+        procps \
         ca-certificates \
         curl \
     && rm -rf /var/lib/apt/lists/*
