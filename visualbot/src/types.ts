@@ -64,6 +64,23 @@ export interface StageTiming {
   ms: number;
 }
 
+export interface FailedRoute {
+  pagePath: string;
+  error: string;
+}
+
+export interface UnchangedRoute {
+  pagePath: string;
+  diff: DiffResult;
+  viewport: ViewportSize;
+}
+
+// Discriminated union returned by screenshotPages — a per-page failure no
+// longer throws and kills the whole run; it lands here instead.
+export type ScreenshotOutcome =
+  | { ok: true; data: ScreenshotResult }
+  | { ok: false; pagePath: string; error: string };
+
 export interface PipelineStageError extends Error {
   stage: string;
 }

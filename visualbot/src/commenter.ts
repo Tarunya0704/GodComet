@@ -15,7 +15,7 @@
 import type { Context } from "probot";
 import { log } from "./utils.js";
 import { isRetriableHttpError, retryWithBackoff } from "./utils.js";
-import type { PageDiff } from "./types.js";
+import type { FailedRoute, PageDiff, UnchangedRoute } from "./types.js";
 
 interface CommentTarget {
   owner: string;
@@ -227,12 +227,28 @@ export async function postErrorComment(
   }
 }
 
+// All routes passed, none changed. Keeps the same terse look as before for
+// single-route repos; for multi-route shows a count and collapsed score rows.
 export async function postNoChangeComment(
   context: Context<"pull_request">,
   target: CommentTarget,
   commentId: number,
-  scoresLine: string
+  unchangedRoutes: UnchangedRoute[]
 ): Promise<void> {
+  let scoresLine: string;
+  if (unchangedRoutes.length === 1) {
+    const r = unchangedRoutes[0];
+    scoresLine =
+      `_Pixel change ${r.diff.percentChanged.toFixed(3)}% · ` +
+      `SSIM ${fmtPct(r.diff.ssimScore)} · ` +
+      `Pixel sim ${fmtPct(r.diff.pixelSimilarityScore)} · ` +
+      `Composite ${fmtPct(r.diff.compositeScore)}_`;
+  } else if (unchangedRoutes.length > 1) {
+    scoresLine = `_${unchangedRoutes.length} routes checked — all below the visual change threshold._`;
+  } else {
+    scoresLine = "_All pages below the change threshold._";
+  }
+
   const body =
     "## 👁 VisualBot — ✅ No Visual Changes\n\n" +
     "No significant visual differences detected in this PR.\n\n" +
@@ -252,7 +268,9 @@ interface AssetUrls {
   diffUrl: string;
 }
 
-function buildSection(d: PageDiff, urls: AssetUrls | null): string {
+// Changed route: <details open> so it's expanded by default — these are the
+// interesting ones the reviewer needs to look at.
+function buildChangedSection(d: PageDiff, urls: AssetUrls | null): string {
   const flags: string[] = [];
   if (d.diff.aspectRatioCropApplied) flags.push("✂ AR-cropped");
   if (d.diff.dimensionMismatch) flags.push("📐 dim-normalized");
@@ -273,33 +291,73 @@ function buildSection(d: PageDiff, urls: AssetUrls | null): string {
     `<sub>Viewport: ${d.viewport.width}×${d.viewport.height} · ` +
     `Diffed at ${d.diff.width}×${d.diff.height}${flagLine}</sub>`;
 
-  if (urls) {
-    return (
-      `### \`${d.pagePath}\`\n\n` +
-      `| Before | After | Diff |\n` +
+  const summary =
+    `<code>${d.pagePath}</code> — 🔴 Changed · ` +
+    `Pixel: ${d.diff.percentChanged.toFixed(2)}% · Composite: ${fmtPct(d.diff.compositeScore)}`;
+
+  const inner = urls
+    ? `| Before | After | Diff |\n` +
       `|--------|-------|------|\n` +
       `| ![before](${urls.beforeUrl}) | ![after](${urls.afterUrl}) | ![diff](${urls.diffUrl}) |\n\n` +
-      `${metricsLine}\n\n${footer}\n`
-    );
-  }
-  // Text-only fallback.
-  return `### \`${d.pagePath}\`\n\n${metricsLine}\n\n${footer}\n`;
+      `${metricsLine}\n\n${footer}`
+    : `${metricsLine}\n\n${footer}`;
+
+  return `<details open>\n<summary>${summary}</summary>\n\n${inner}\n\n</details>`;
+}
+
+// Unchanged route: collapsed by default — visible in the summary line but
+// doesn't clutter the comment for reviewers who just want to see what changed.
+function buildUnchangedSection(u: UnchangedRoute): string {
+  const summary =
+    `<code>${u.pagePath}</code> — ✅ No change · ` +
+    `Pixel: ${u.diff.percentChanged.toFixed(2)}% · Composite: ${fmtPct(u.diff.compositeScore)}`;
+  const inner =
+    `_Pixel change ${u.diff.percentChanged.toFixed(3)}% · ` +
+    `SSIM ${fmtPct(u.diff.ssimScore)} · ` +
+    `Pixel sim ${fmtPct(u.diff.pixelSimilarityScore)} · ` +
+    `Composite ${fmtPct(u.diff.compositeScore)}_\n\n` +
+    `<sub>Viewport: ${u.viewport.width}×${u.viewport.height} · ` +
+    `Diffed at ${u.diff.width}×${u.diff.height}</sub>`;
+  return `<details>\n<summary>${summary}</summary>\n\n${inner}\n\n</details>`;
+}
+
+// Failed route: collapsed, shows the truncated error message so the developer
+// knows why this route was skipped without it dominating the comment.
+function buildFailedSection(f: FailedRoute): string {
+  const summary = `<code>${f.pagePath}</code> — ❌ Failed`;
+  const inner = "```\n" + f.error.slice(0, 500) + "\n```";
+  return `<details>\n<summary>${summary}</summary>\n\n${inner}\n\n</details>`;
 }
 
 function buildBody(
   prNumber: number,
-  sections: string[],
+  changedSections: string[],
+  unchangedSections: string[],
+  failedSections: string[],
   uploadError: string | null
 ): string {
+  const total = changedSections.length + unchangedSections.length + failedSections.length;
+  const parts: string[] = [`${total} route${total !== 1 ? "s" : ""} checked`];
+  if (changedSections.length) parts.push(`**${changedSections.length} changed**`);
+  if (unchangedSections.length) parts.push(`${unchangedSections.length} no change`);
+  if (failedSections.length) parts.push(`${failedSections.length} ❌ failed`);
+  const summaryLine = `PR #${prNumber} · ${parts.join(" · ")}`;
+
   const uploadNote = uploadError
-    ? `\n> ℹ️ Image upload to \`${ASSET_BRANCH}\` failed — showing numbers only.\n> Error: \`${uploadError.slice(0, 200)}\`\n> Confirm the App has **Contents: write** permission.\n\n`
+    ? `\n> ℹ️ Image upload to \`${ASSET_BRANCH}\` failed — showing numbers only.\n` +
+      `> Error: \`${uploadError.slice(0, 200)}\`\n` +
+      `> Confirm the App has **Contents: write** permission.\n\n`
     : "";
+
+  const allSections = [...changedSections, ...unchangedSections, ...failedSections];
+
   return (
     `## 👁 VisualBot — Visual Change Report\n\n` +
-    `**PR #${prNumber}** has visual changes on ${sections.length} page(s).\n` +
+    `${summaryLine}\n` +
     uploadNote +
-    sections.join("\n---\n\n") +
-    `\n---\n<sub>VisualBot • Catch visual regressions before they ship · ` +
+    `\n` +
+    allSections.join("\n\n---\n\n") +
+    `\n\n---\n<sub>VisualBot • Catch visual regressions before they ship · ` +
     `Scores ported from GodComet's visual auditor (SSIM + pixelmatch + pixel-sim composite).</sub>`
   );
 }
@@ -308,7 +366,9 @@ export async function postChangeComment(
   context: Context<"pull_request">,
   target: CommentTarget,
   commentId: number,
-  diffs: PageDiff[]
+  diffs: PageDiff[],
+  unchangedRoutes: UnchangedRoute[],
+  failedRoutes: FailedRoute[]
 ): Promise<void> {
   const { owner, repo, prNumber } = target;
   const headSha = context.payload.pull_request.head.sha.slice(0, 7);
@@ -364,7 +424,10 @@ export async function postChangeComment(
     urlsPerDiff = [];
   }
 
-  const sections = diffs.map((d, i) => buildSection(d, urlsPerDiff[i] ?? null));
-  const body = buildBody(prNumber, sections, uploadError);
+  const changedSections = diffs.map((d, i) => buildChangedSection(d, urlsPerDiff[i] ?? null));
+  const unchangedSections = unchangedRoutes.map(buildUnchangedSection);
+  const failedSections = failedRoutes.map(buildFailedSection);
+
+  const body = buildBody(prNumber, changedSections, unchangedSections, failedSections, uploadError);
   await updateComment(context, target, commentId, body);
 }

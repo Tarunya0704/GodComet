@@ -31,13 +31,15 @@ import {
 import {
   DEFAULT_VIEWPORT,
   VISUAL_CHANGE_THRESHOLD_PCT,
+  type FailedRoute,
   type PageDiff,
-  type ScreenshotResult,
+  type ScreenshotOutcome,
   type StageTiming,
+  type UnchangedRoute,
 } from "./types.js";
+import { readConfig } from "./config.js";
 
 const PIPELINE_TIMEOUT_MS = 5 * 60 * 1000;
-const PAGES_TO_SHOOT = ["/"];
 
 async function getInstallationToken(
   context: Context<"pull_request">
@@ -55,8 +57,9 @@ async function getInstallationToken(
 async function buildAndShoot(
   repoDir: string,
   side: "base" | "head",
+  routes: string[],
   timings: StageTiming[]
-): Promise<Map<string, ScreenshotResult>> {
+): Promise<Map<string, ScreenshotOutcome>> {
   const port = await findAvailablePort();
   let server: RunningServer | null = null;
   try {
@@ -65,7 +68,7 @@ async function buildAndShoot(
       `${side}.screenshot`,
       () =>
         screenshotPages(server!.port, {
-          pages: PAGES_TO_SHOOT,
+          pages: routes,
           viewport: DEFAULT_VIEWPORT,
           pageTimeoutMs: 30_000,
           maxRetries: 2,
@@ -142,48 +145,80 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
       timings
     );
 
+    // Read config from the PR's head — so adding .shirodiff.yml in a PR
+    // immediately affects that PR's own run. Falls back to { routes: ["/"] }
+    // when the file is missing or malformed (full backward compatibility).
+    currentStage = "config";
+    const config = await timed("config", async () => readConfig(headDir), timings);
+    log(`[pipeline] routes: ${config.routes.join(", ")}`);
+
     currentStage = "base";
-    const baseShots = await buildAndShoot(baseDir, "base", timings);
+    const baseShots = await buildAndShoot(baseDir, "base", config.routes, timings);
 
     currentStage = "head";
-    const headShots = await buildAndShoot(headDir, "head", timings);
+    const headShots = await buildAndShoot(headDir, "head", config.routes, timings);
 
     currentStage = "diff";
     const diffs: PageDiff[] = [];
-    let firstNoChange = "";
+    const unchangedRoutes: UnchangedRoute[] = [];
+    const failedRoutes: FailedRoute[] = [];
+
     await timed(
       "diff",
       async () => {
-        for (const path of PAGES_TO_SHOOT) {
-          const before = baseShots.get(path);
-          const after = headShots.get(path);
-          if (!before || !after) {
-            log(`[diff] missing screenshot for ${path}, skipping`);
-            continue;
-          }
-          // Diff on viewport-only — render_engine.py learned that fixed-viewport
-          // gives more meaningful comparisons than full-page (page height
-          // varies independently of UI changes).
-          const diffResult = await diffPngs(before.viewport, after.viewport);
-          log(
-            `[diff] ${path}: ${diffResult.percentChanged.toFixed(3)}% changed · ` +
-              `SSIM ${(diffResult.ssimScore * 100).toFixed(2)}% · ` +
-              `composite ${(diffResult.compositeScore * 100).toFixed(2)}%`
-          );
-          if (diffResult.percentChanged >= VISUAL_CHANGE_THRESHOLD_PCT) {
-            // Use full-page PNGs for the comment (more useful for humans).
-            diffs.push({
-              pagePath: path,
-              beforePng: before.fullPage,
-              afterPng: after.fullPage,
-              diff: diffResult,
-              viewport: before.viewportDimensions,
-            });
-          } else if (!firstNoChange) {
-            firstNoChange =
-              `_Pixel change ${diffResult.percentChanged.toFixed(3)}% · ` +
-              `SSIM ${(diffResult.ssimScore * 100).toFixed(2)}% · ` +
-              `Composite ${(diffResult.compositeScore * 100).toFixed(2)}%_`;
+        for (const path of config.routes) {
+          // Per-route error isolation: a bad route records a failure and
+          // continues — it never kills the rest of the run or the comment.
+          try {
+            const baseOutcome = baseShots.get(path);
+            const headOutcome = headShots.get(path);
+
+            if (!baseOutcome || !headOutcome) {
+              failedRoutes.push({ pagePath: path, error: "Screenshot missing from result map" });
+              continue;
+            }
+            if (!baseOutcome.ok) {
+              failedRoutes.push({ pagePath: path, error: `base: ${baseOutcome.error}` });
+              continue;
+            }
+            if (!headOutcome.ok) {
+              failedRoutes.push({ pagePath: path, error: `head: ${headOutcome.error}` });
+              continue;
+            }
+
+            const before = baseOutcome.data;
+            const after = headOutcome.data;
+
+            // Diff on viewport-only — render_engine.py learned that fixed-viewport
+            // gives more meaningful comparisons than full-page (page height
+            // varies independently of UI changes).
+            const diffResult = await diffPngs(before.viewport, after.viewport);
+            log(
+              `[diff] ${path}: ${diffResult.percentChanged.toFixed(3)}% changed · ` +
+                `SSIM ${(diffResult.ssimScore * 100).toFixed(2)}% · ` +
+                `composite ${(diffResult.compositeScore * 100).toFixed(2)}%`
+            );
+
+            if (diffResult.percentChanged >= VISUAL_CHANGE_THRESHOLD_PCT) {
+              // Use full-page PNGs for the comment (more useful for humans).
+              diffs.push({
+                pagePath: path,
+                beforePng: before.fullPage,
+                afterPng: after.fullPage,
+                diff: diffResult,
+                viewport: before.viewportDimensions,
+              });
+            } else {
+              unchangedRoutes.push({
+                pagePath: path,
+                diff: diffResult,
+                viewport: before.viewportDimensions,
+              });
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logError(`[diff] ${path} failed: ${msg}`);
+            failedRoutes.push({ pagePath: path, error: msg });
           }
         }
       },
@@ -191,23 +226,16 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
     );
 
     currentStage = "comment";
-    if (diffs.length === 0) {
+    if (diffs.length === 0 && failedRoutes.length === 0) {
       await timed(
         "comment.no-change",
-        () =>
-          postNoChangeComment(
-            context,
-            target,
-            pendingId!,
-            firstNoChange ||
-              "_All pages below the change threshold._"
-          ),
+        () => postNoChangeComment(context, target, pendingId!, unchangedRoutes),
         timings
       );
     } else {
       await timed(
         "comment.change",
-        () => postChangeComment(context, target, pendingId!, diffs),
+        () => postChangeComment(context, target, pendingId!, diffs, unchangedRoutes, failedRoutes),
         timings
       );
     }

@@ -17,7 +17,7 @@ import {
   DEFAULT_VIEWPORT,
   FONT_SETTLE_MS,
   MIN_SCREENSHOT_BYTES,
-  type ScreenshotResult,
+  type ScreenshotOutcome,
   type ViewportSize,
 } from "./types.js";
 import { log } from "./utils.js";
@@ -135,13 +135,13 @@ async function captureOnce(
 export async function screenshotPages(
   port: number,
   opts: ScreenshotOptions
-): Promise<Map<string, ScreenshotResult>> {
+): Promise<Map<string, ScreenshotOutcome>> {
   const viewport = opts.viewport ?? DEFAULT_VIEWPORT;
   const pageTimeoutMs = opts.pageTimeoutMs ?? DEFAULT_PAGE_TIMEOUT_MS;
   const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
   const shouldDisableAnimations = opts.disableAnimations ?? true;
 
-  const result = new Map<string, ScreenshotResult>();
+  const result = new Map<string, ScreenshotOutcome>();
   let browser: Browser | null = null;
   try {
     browser = await chromium.launch({
@@ -200,9 +200,13 @@ export async function screenshotPages(
       }
 
       if (!captured) {
-        throw lastErr instanceof Error
-          ? lastErr
-          : new Error(`Screenshot of ${path} failed after ${maxRetries + 1} attempts`);
+        const errMsg =
+          lastErr instanceof Error
+            ? lastErr.message
+            : `Screenshot of ${path} failed after ${maxRetries + 1} attempts`;
+        log(`[shot] ${path}: all attempts failed — ${errMsg}`);
+        result.set(path, { ok: false, pagePath: path, error: errMsg });
+        continue;
       }
 
       const fullSize = captured.fullPage.byteLength;
@@ -211,16 +215,19 @@ export async function screenshotPages(
         fullSize < MIN_SCREENSHOT_BYTES && vpSize < MIN_SCREENSHOT_BYTES;
 
       result.set(path, {
-        pagePath: path,
-        fullPage: captured.fullPage,
-        fullPageBytes: fullSize,
-        fullPageDimensions: captured.fullPageDimensions,
-        viewport: captured.viewport,
-        viewportBytes: vpSize,
-        viewportDimensions: captured.viewportDimensions,
-        suspectedBroken,
-        captureMs: captured.ms,
-        retryCount,
+        ok: true,
+        data: {
+          pagePath: path,
+          fullPage: captured.fullPage,
+          fullPageBytes: fullSize,
+          fullPageDimensions: captured.fullPageDimensions,
+          viewport: captured.viewport,
+          viewportBytes: vpSize,
+          viewportDimensions: captured.viewportDimensions,
+          suspectedBroken,
+          captureMs: captured.ms,
+          retryCount,
+        },
       });
       log(
         `[shot] ${path}: full=${fullSize}B (${captured.fullPageDimensions.width}×${captured.fullPageDimensions.height}) ` +
