@@ -10,17 +10,18 @@ export interface ShiroDiffConfig {
 const DEFAULT_CONFIG: ShiroDiffConfig = { routes: ["/"] };
 const MAX_ROUTES = 20;
 
-// Reads .shirodiff.yml from the root of the cloned repo directory.
-// Always returns a valid config — falls back to { routes: ["/"] } on any
-// error (missing file, bad YAML, wrong schema) so the existing single-page
-// behavior is fully preserved for repos that don't have the file.
-export function readConfig(repoDir: string): ShiroDiffConfig {
+// Reads .shirodiff.yml from the root of the cloned repo.
+//
+// Returns null  → file doesn't exist; caller should use auto-detection.
+// Returns config → file exists (caller respects it even if it defaulted due to
+//                  bad YAML, because the presence of the file signals intent).
+export function readConfig(repoDir: string): ShiroDiffConfig | null {
   const configPath = join(repoDir, ".shirodiff.yml");
   let raw: string;
   try {
     raw = readFileSync(configPath, "utf-8");
   } catch {
-    return DEFAULT_CONFIG;
+    return null;
   }
 
   try {

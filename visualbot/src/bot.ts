@@ -38,6 +38,7 @@ import {
   type UnchangedRoute,
 } from "./types.js";
 import { readConfig } from "./config.js";
+import { detectRoutes, type DetectionResult } from "./route-detector.js";
 
 const PIPELINE_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -52,6 +53,23 @@ async function getInstallationToken(
     installation_id: installationId,
   });
   return data.token;
+}
+
+// Fetches the list of files changed in the PR (first 100).
+// Used by the route auto-detector before the clone step.
+async function getPrChangedFiles(
+  context: Context<"pull_request">,
+  owner: string,
+  repo: string,
+  prNumber: number
+): Promise<string[]> {
+  const { data } = await context.octokit.pulls.listFiles({
+    owner,
+    repo,
+    pull_number: prNumber,
+    per_page: 100,
+  });
+  return data.map(f => f.filename);
 }
 
 async function buildAndShoot(
@@ -111,6 +129,16 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
       timings
     );
 
+    // Fetch the PR file list early — it's a cheap API call and feeds the
+    // route auto-detector that runs after the clone.
+    currentStage = "files";
+    const prChangedFiles = await timed(
+      "files",
+      () => getPrChangedFiles(context, owner, repo, prNumber),
+      timings
+    );
+    log(`[pipeline] PR has ${prChangedFiles.length} changed file(s)`);
+
     currentStage = "tempdir";
     const [baseDir, headDir] = await timed(
       "tempdir",
@@ -145,18 +173,29 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
       timings
     );
 
-    // Read config from the PR's head — so adding .shirodiff.yml in a PR
-    // immediately affects that PR's own run. Falls back to { routes: ["/"] }
-    // when the file is missing or malformed (full backward compatibility).
-    currentStage = "config";
-    const config = await timed("config", async () => readConfig(headDir), timings);
-    log(`[pipeline] routes: ${config.routes.join(", ")}`);
+    // Route resolution — manual config wins, auto-detect is the fallback.
+    currentStage = "routes";
+    let routes: string[];
+    let detection: DetectionResult | null = null;
+
+    const manualConfig = readConfig(headDir);
+    if (manualConfig) {
+      routes = manualConfig.routes;
+      log(`[pipeline] using .shirodiff.yml routes: ${routes.join(", ")}`);
+    } else {
+      detection = await timed(
+        "routes",
+        async () => detectRoutes(prChangedFiles, headDir),
+        timings
+      );
+      routes = detection.routes;
+    }
 
     currentStage = "base";
-    const baseShots = await buildAndShoot(baseDir, "base", config.routes, timings);
+    const baseShots = await buildAndShoot(baseDir, "base", routes, timings);
 
     currentStage = "head";
-    const headShots = await buildAndShoot(headDir, "head", config.routes, timings);
+    const headShots = await buildAndShoot(headDir, "head", routes, timings);
 
     currentStage = "diff";
     const diffs: PageDiff[] = [];
@@ -166,7 +205,7 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
     await timed(
       "diff",
       async () => {
-        for (const path of config.routes) {
+        for (const path of routes) {
           // Per-route error isolation: a bad route records a failure and
           // continues — it never kills the rest of the run or the comment.
           try {
@@ -225,17 +264,29 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
       timings
     );
 
+    // Build a subtle footer note so reviewers know how routes were picked.
+    const detectionNote = buildDetectionNote(detection, manualConfig !== null);
+
     currentStage = "comment";
     if (diffs.length === 0 && failedRoutes.length === 0) {
       await timed(
         "comment.no-change",
-        () => postNoChangeComment(context, target, pendingId!, unchangedRoutes),
+        () => postNoChangeComment(context, target, pendingId!, unchangedRoutes, detectionNote),
         timings
       );
     } else {
       await timed(
         "comment.change",
-        () => postChangeComment(context, target, pendingId!, diffs, unchangedRoutes, failedRoutes),
+        () =>
+          postChangeComment(
+            context,
+            target,
+            pendingId!,
+            diffs,
+            unchangedRoutes,
+            failedRoutes,
+            detectionNote
+          ),
         timings
       );
     }
@@ -257,6 +308,29 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
   } finally {
     await cleanupTempDir(prNumber);
   }
+}
+
+function buildDetectionNote(
+  detection: DetectionResult | null,
+  hadManualConfig: boolean
+): string | undefined {
+  if (hadManualConfig) return undefined;
+  if (!detection) return undefined;
+
+  const parts: string[] = [
+    `Routes auto-detected · ${detection.framework}`,
+  ];
+  if (detection.hadGlobalChanges) {
+    parts.push("global file(s) changed → / included");
+  }
+  if (detection.skippedDynamic.length > 0) {
+    const names = detection.skippedDynamic.slice(0, 3).join(", ");
+    const extra = detection.skippedDynamic.length > 3
+      ? ` +${detection.skippedDynamic.length - 3} more`
+      : "";
+    parts.push(`dynamic routes skipped: ${names}${extra}`);
+  }
+  return parts.join(" · ");
 }
 
 export async function handlePR(context: Context<"pull_request">): Promise<void> {

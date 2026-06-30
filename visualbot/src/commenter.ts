@@ -233,7 +233,8 @@ export async function postNoChangeComment(
   context: Context<"pull_request">,
   target: CommentTarget,
   commentId: number,
-  unchangedRoutes: UnchangedRoute[]
+  unchangedRoutes: UnchangedRoute[],
+  detectionNote?: string
 ): Promise<void> {
   let scoresLine: string;
   if (unchangedRoutes.length === 1) {
@@ -249,11 +250,13 @@ export async function postNoChangeComment(
     scoresLine = "_All pages below the change threshold._";
   }
 
+  const noteBlock = detectionNote ? `\n<sub>${detectionNote}</sub>\n` : "";
   const body =
     "## 👁 VisualBot — ✅ No Visual Changes\n\n" +
     "No significant visual differences detected in this PR.\n\n" +
-    `${scoresLine}\n\n` +
-    "---\n" +
+    `${scoresLine}\n` +
+    noteBlock +
+    "\n---\n" +
     "<sub>VisualBot • Catch visual regressions before they ship</sub>";
   await updateComment(context, target, commentId, body);
 }
@@ -334,7 +337,8 @@ function buildBody(
   changedSections: string[],
   unchangedSections: string[],
   failedSections: string[],
-  uploadError: string | null
+  uploadError: string | null,
+  detectionNote: string | undefined
 ): string {
   const total = changedSections.length + unchangedSections.length + failedSections.length;
   const parts: string[] = [`${total} route${total !== 1 ? "s" : ""} checked`];
@@ -350,6 +354,7 @@ function buildBody(
     : "";
 
   const allSections = [...changedSections, ...unchangedSections, ...failedSections];
+  const noteFragment = detectionNote ? ` · ${detectionNote}` : "";
 
   return (
     `## 👁 VisualBot — Visual Change Report\n\n` +
@@ -358,7 +363,8 @@ function buildBody(
     `\n` +
     allSections.join("\n\n---\n\n") +
     `\n\n---\n<sub>VisualBot • Catch visual regressions before they ship · ` +
-    `Scores ported from GodComet's visual auditor (SSIM + pixelmatch + pixel-sim composite).</sub>`
+    `Scores ported from GodComet's visual auditor (SSIM + pixelmatch + pixel-sim composite)` +
+    `${noteFragment}.</sub>`
   );
 }
 
@@ -368,7 +374,8 @@ export async function postChangeComment(
   commentId: number,
   diffs: PageDiff[],
   unchangedRoutes: UnchangedRoute[],
-  failedRoutes: FailedRoute[]
+  failedRoutes: FailedRoute[],
+  detectionNote?: string
 ): Promise<void> {
   const { owner, repo, prNumber } = target;
   const headSha = context.payload.pull_request.head.sha.slice(0, 7);
@@ -428,6 +435,6 @@ export async function postChangeComment(
   const unchangedSections = unchangedRoutes.map(buildUnchangedSection);
   const failedSections = failedRoutes.map(buildFailedSection);
 
-  const body = buildBody(prNumber, changedSections, unchangedSections, failedSections, uploadError);
+  const body = buildBody(prNumber, changedSections, unchangedSections, failedSections, uploadError, detectionNote);
   await updateComment(context, target, commentId, body);
 }
