@@ -13,7 +13,7 @@
 //     the reader knows the diff was normalized.
 
 import type { Context } from "probot";
-import { log } from "./utils.js";
+import { log, logError } from "./utils.js";
 import { isRetriableHttpError, retryWithBackoff } from "./utils.js";
 import type { FailedRoute, PageDiff, UnchangedRoute } from "./types.js";
 
@@ -206,23 +206,39 @@ export async function postErrorComment(
       ? "\n\n**Stage timings:**\n" +
         timings.map((t) => `- \`${t.stage}\` — ${t.ms}ms`).join("\n")
       : "";
+  // A 403 here is almost always a stale installation that predates the App's
+  // current permission set — the repo owner has to accept the update.
+  const isPermissionError =
+    message.includes("403") || message.includes("Resource not accessible");
+  const permissionHint = isPermissionError
+    ? "\n\n> ⚠️ **Configuration Error:** The GitHub App is missing **Pull requests: Read & write** or **Contents: write** permissions in your repository settings."
+    : "";
   const body =
     `${header}\n\nVisualBot encountered an error while analyzing this PR:\n\n` +
     "```\n" +
     message.slice(0, 4000) +
     "\n```" +
     timingBlock +
+    permissionHint +
     "\n\n<sub>VisualBot • Catch visual regressions before they ship</sub>";
-  if (commentId) {
-    await updateComment(context, target, commentId, body);
-  } else {
-    await gh("createComment.error", () =>
-      context.octokit.issues.createComment({
-        owner: target.owner,
-        repo: target.repo,
-        issue_number: target.prNumber,
-        body,
-      })
+  try {
+    if (commentId) {
+      await updateComment(context, target, commentId, body);
+    } else {
+      await gh("createComment.error", () =>
+        context.octokit.issues.createComment({
+          owner: target.owner,
+          repo: target.repo,
+          issue_number: target.prNumber,
+          body,
+        })
+      );
+    }
+  } catch (err) {
+    // Last resort — if we can't even report the failure, it must hit the logs.
+    logError(
+      "[commenter] FATAL: Completely unable to post error comment to GitHub:",
+      err
     );
   }
 }

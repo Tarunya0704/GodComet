@@ -116,11 +116,19 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
   let currentStage: string | null = null;
 
   try {
-    pendingId = await timed(
-      "comment.pending",
-      () => postPendingComment(context, target),
-      timings
-    );
+    try {
+      pendingId = await timed(
+        "comment.pending",
+        () => postPendingComment(context, target),
+        timings
+      );
+    } catch (err) {
+      logError(
+        "[pipeline] Failed to post pending comment (check GitHub App permissions):",
+        err
+      );
+      // Continue running the pipeline even if the comment fails.
+    }
 
     currentStage = "auth";
     const installationToken = await timed(
