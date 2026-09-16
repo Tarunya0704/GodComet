@@ -1,4 +1,4 @@
-mcp>=1.19.0
+mcp==1.29.0
 groq>=0.9.0
 fastapi>=0.104.0
 uvicorn>=0.24.0
@@ -11,3 +11,6 @@ pyyaml>=6.0.0
 requests>=2.31.0
 boto3>=1.34.0
 jira>=3.6.0
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+pandas>=2.0.0
