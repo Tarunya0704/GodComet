@@ -3,6 +3,11 @@ import { cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { log, waitForServer, killProcess } from "./utils.js";
+import {
+  findStaticDir,
+  serveStaticDir,
+  NoServableOutputError,
+} from "./static-server.js";
 
 export interface RunningServer {
   process: ChildProcess;
@@ -75,10 +80,15 @@ function startServer(
   return proc;
 }
 
-export async function buildAndStart(
-  repoDir: string,
-  port: number
-): Promise<RunningServer> {
+interface BuildContext {
+  pm: "npm" | "yarn" | "pnpm";
+  scripts: Record<string, string>;
+  env: NodeJS.ProcessEnv;
+  installEnv: NodeJS.ProcessEnv;
+  visualbotModules: string;
+}
+
+function prepareBuildContext(repoDir: string, port: number): BuildContext {
   const pm = detectPackageManager(repoDir);
   const scripts = readScripts(repoDir);
   const visualbotDir = dirname(fileURLToPath(import.meta.url));
@@ -94,7 +104,12 @@ export async function buildAndStart(
   const installEnv: NodeJS.ProcessEnv = { ...process.env, CI: "1", NODE_ENV: "development", NODE_PATH: nodePath };
   const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), CI: "1", NODE_PATH: nodePath };
 
-  log(`[builder] using ${pm} in ${repoDir}, PORT=${port}`);
+  return { pm, scripts, env, installEnv, visualbotModules };
+}
+
+async function installDependencies(repoDir: string, ctx: BuildContext): Promise<void> {
+  const { pm, installEnv, visualbotModules } = ctx;
+  log(`[builder] using ${pm} in ${repoDir}`);
 
   const installArgs =
     pm === "npm" ? ["install", "--no-audit", "--no-fund"] : ["install"];
@@ -113,14 +128,33 @@ export async function buildAndStart(
       cpSync(srcTailwindPostcss, destTailwindPostcss, { recursive: true });
     }
   }
+}
 
-  if (scripts.build) {
-    log(`[builder] running ${pm} run build`);
-    await runCommand(pm, ["run", "build"], repoDir, env);
+async function runBuildScript(repoDir: string, ctx: BuildContext): Promise<void> {
+  if (ctx.scripts.build) {
+    log(`[builder] running ${ctx.pm} run build`);
+    await runCommand(ctx.pm, ["run", "build"], repoDir, ctx.env);
   } else {
     log("[builder] no build script — skipping");
   }
+}
 
+/**
+ * Tier 4 — install, build, and boot the project's own server.
+ *
+ * Used when the repo has a `start` or `dev` script to run.
+ */
+export async function buildAndStart(
+  repoDir: string,
+  port: number
+): Promise<RunningServer> {
+  const ctx = prepareBuildContext(repoDir, port);
+  log(`[builder] PORT=${port}`);
+
+  await installDependencies(repoDir, ctx);
+  await runBuildScript(repoDir, ctx);
+
+  const { scripts, pm, env } = ctx;
   let startScript: string;
   let startArgs: string[];
   if (scripts.start) {
@@ -154,5 +188,54 @@ export async function buildAndStart(
   }
 
   log(`[builder] server ready on port ${port}`);
+  return { process: proc, port };
+}
+
+/**
+ * Tier 3 — install, build, then serve the emitted static directory.
+ *
+ * Used when the repo has a `build` script but nothing to `start`. Avoids
+ * booting a dev server entirely: the build output is plain files, so a static
+ * server is both sufficient and far more predictable.
+ */
+export async function buildAndServeStatic(
+  repoDir: string,
+  port: number
+): Promise<RunningServer> {
+  const ctx = prepareBuildContext(repoDir, port);
+  log(`[builder] static-output mode, PORT=${port}`);
+
+  await installDependencies(repoDir, ctx);
+  await runBuildScript(repoDir, ctx);
+
+  const staticDir = findStaticDir(repoDir);
+  if (!staticDir) {
+    throw new NoServableOutputError(
+      "Build completed but no servable static output was found " +
+        "(looked for dist/, build/, out/, _site/, public/ containing an index.html)"
+    );
+  }
+
+  const proc = await serveStaticDir(staticDir, port);
+
+  let exitedEarly: Error | null = null;
+  proc.on("exit", (code, signal) => {
+    if (code !== 0 && code !== null) {
+      exitedEarly = new Error(
+        `Static server exited early with code ${code} signal ${signal}`
+      );
+    }
+  });
+
+  try {
+    // Static serving has no compile step, so it is ready almost immediately.
+    await waitForServer(port, 30_000);
+  } catch (err) {
+    await killProcess(proc);
+    if (exitedEarly) throw exitedEarly;
+    throw err;
+  }
+
+  log(`[builder] static server ready on port ${port}`);
   return { process: proc, port };
 }

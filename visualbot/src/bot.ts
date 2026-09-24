@@ -19,7 +19,11 @@ import {
 } from "./utils.js";
 import type { StageError } from "./utils.js";
 import { cloneAtSha } from "./clone.js";
-import { buildAndStart, type RunningServer } from "./builder.js";
+import {
+  buildAndStart,
+  buildAndServeStatic,
+  type RunningServer,
+} from "./builder.js";
 import { screenshotPages } from "./screenshotter.js";
 import { diffPngs } from "./differ.js";
 import {
@@ -27,6 +31,7 @@ import {
   postErrorComment,
   postNoChangeComment,
   postChangeComment,
+  deleteComment,
 } from "./commenter.js";
 import {
   DEFAULT_VIEWPORT,
@@ -39,6 +44,8 @@ import {
 } from "./types.js";
 import { readConfig } from "./config.js";
 import { detectRoutes, type DetectionResult } from "./route-detector.js";
+import { checkEligibility, logEligibility } from "./eligibility.js";
+import { isSilentSkip, isNextStaticExport } from "./static-server.js";
 
 const PIPELINE_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -76,12 +83,20 @@ async function buildAndShoot(
   repoDir: string,
   side: "base" | "head",
   routes: string[],
-  timings: StageTiming[]
+  timings: StageTiming[],
+  useStaticOutput: boolean
 ): Promise<Map<string, ScreenshotOutcome>> {
   const port = await findAvailablePort();
   let server: RunningServer | null = null;
   try {
-    server = await timed(`${side}.build+start`, () => buildAndStart(repoDir, port), timings);
+    server = await timed(
+      `${side}.build+start`,
+      () =>
+        useStaticOutput
+          ? buildAndServeStatic(repoDir, port)
+          : buildAndStart(repoDir, port),
+      timings
+    );
     return await timed(
       `${side}.screenshot`,
       () =>
@@ -110,6 +125,16 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
   log(
     `PR #${prNumber} ${owner}/${repo}: base ${baseSha.slice(0, 7)} head ${headSha.slice(0, 7)}`
   );
+
+  // Pre-flight. One Contents API call, before git and before any comment: if
+  // this repo isn't something we can boot and screenshot, leave without a
+  // trace. A red ❌ on a Python or SQL repo reads as a broken bot, not as a
+  // bot that politely isn't for you.
+  const eligibility = await checkEligibility(context, owner, repo, headSha);
+  logEligibility(owner, repo, eligibility);
+  if (!eligibility.eligible) return;
+
+  let useStaticOutput = eligibility.hasStaticBuild === true;
 
   const timings: StageTiming[] = [];
   let pendingId: number | null = null;
@@ -181,6 +206,16 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
       timings
     );
 
+    // Next.js `output: 'export'` produces a purely static site, and its
+    // `next start` refuses to serve one ("next start does not work with
+    // output: export"). The pre-flight gate sees the start script and picks
+    // the dev-server path, so correct that here — next.config is only
+    // readable now that the repo is on disk.
+    if (!useStaticOutput && isNextStaticExport(headDir)) {
+      log("[pipeline] next.config declares output:'export' — switching to static-output mode");
+      useStaticOutput = true;
+    }
+
     // Route resolution — manual config wins, auto-detect is the fallback.
     currentStage = "routes";
     let routes: string[];
@@ -200,10 +235,10 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
     }
 
     currentStage = "base";
-    const baseShots = await buildAndShoot(baseDir, "base", routes, timings);
+    const baseShots = await buildAndShoot(baseDir, "base", routes, timings, useStaticOutput);
 
     currentStage = "head";
-    const headShots = await buildAndShoot(headDir, "head", routes, timings);
+    const headShots = await buildAndShoot(headDir, "head", routes, timings, useStaticOutput);
 
     currentStage = "diff";
     const diffs: PageDiff[] = [];
@@ -307,6 +342,19 @@ async function runPipeline(context: Context<"pull_request">): Promise<void> {
     const stage =
       (err as StageError).stage ?? currentStage ?? "unknown";
     const msg = err instanceof Error ? err.message : String(err);
+
+    // Ineligibility we could only detect after building (a library whose build
+    // emits no index.html). Same verdict as the pre-flight gate, just reached
+    // later — so it gets the same treatment: withdraw the pending comment and
+    // leave without a mark on the PR.
+    if (isSilentSkip(err)) {
+      log(`[eligibility] ${owner}/${repo} — skipping after build: ${msg}`);
+      if (pendingId !== null) {
+        await deleteComment(context, target, pendingId);
+      }
+      return;
+    }
+
     logError(`pipeline failed at stage="${stage}":`, msg);
     try {
       await postErrorComment(context, target, pendingId, stage, msg, timings);

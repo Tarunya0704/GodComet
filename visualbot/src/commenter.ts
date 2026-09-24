@@ -154,6 +154,33 @@ async function uploadAsset(
   return `https://raw.githubusercontent.com/${owner}/${repo}/${ASSET_BRANCH}/${path}`;
 }
 
+/**
+ * Remove a comment we posted.
+ *
+ * Used when the pipeline discovers *after* the pending comment that the repo
+ * was never in scope (e.g. a build script that emits a library, not a site).
+ * Leaving a stale "⏳ Analyzing..." behind would be worse than the ❌ we are
+ * avoiding, so we withdraw it and say nothing.
+ */
+export async function deleteComment(
+  context: Context<"pull_request">,
+  target: CommentTarget,
+  commentId: number
+): Promise<void> {
+  try {
+    await gh("deleteComment", () =>
+      context.octokit.issues.deleteComment({
+        owner: target.owner,
+        repo: target.repo,
+        comment_id: commentId,
+      })
+    );
+  } catch (err) {
+    // Non-fatal: a leftover pending comment is untidy, not broken.
+    logError("[commenter] failed to delete pending comment:", err);
+  }
+}
+
 export async function postPendingComment(
   context: Context<"pull_request">,
   target: CommentTarget
